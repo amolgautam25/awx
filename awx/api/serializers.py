@@ -713,6 +713,7 @@ class UnifiedJobSerializer(BaseSerializer):
         read_only=True
     )
 
+
     class Meta:
         model = UnifiedJob
         fields = ('*', 'unified_job_template', 'launch_type', 'status',
@@ -720,7 +721,7 @@ class UnifiedJobSerializer(BaseSerializer):
                   'failed', 'started', 'finished', 'canceled_on', 'elapsed', 'job_args',
                   'job_cwd', 'job_env', 'job_explanation',
                   'execution_node', 'controller_node',
-                  'result_traceback', 'event_processing_finished')
+                  'result_traceback', 'event_processing_finished', 'launched_by')
         extra_kwargs = {
             'unified_job_template': {
                 'source': 'unified_job_template_id',
@@ -773,6 +774,16 @@ class UnifiedJobSerializer(BaseSerializer):
                 if val is not None:
                     summary_fields['source_workflow_job'][field] = val
 
+        if self.is_detail_view:
+            ancestor = obj.ancestor_job
+            if ancestor != obj:
+                summary_fields['ancestor_job'] = {
+                    'id' : ancestor.id,
+                    'name': ancestor.name,
+                    'type': get_type_for_model(ancestor),
+                    'url': ancestor.get_absolute_url()
+                }
+
         return summary_fields
 
     def get_sub_serializer(self, obj):
@@ -816,6 +827,10 @@ class UnifiedJobSerializer(BaseSerializer):
         # it must be marked for translation after it is pulled from the db, not when set
         ret['job_explanation'] = _(obj.job_explanation)
         return ret
+
+    def get_launched_by(self, obj):
+        if obj is not None:
+            return obj.launched_by
 
 
 class UnifiedJobListSerializer(UnifiedJobSerializer):
