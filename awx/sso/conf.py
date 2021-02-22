@@ -285,6 +285,7 @@ def _register_ldap(append=None):
             'SCOPE_SUBTREE',
             '(objectClass=group)',
         ),
+        #depends_on=['AUTH_LDAP{}_GROUP_TYPE'.format(append_str)],
     )
 
     register(
@@ -297,7 +298,7 @@ def _register_ldap(append=None):
         category=_('LDAP'),
         category_slug='ldap',
         default='MemberDNGroupType',
-        depends_on=['AUTH_LDAP{}_GROUP_TYPE_PARAMS'.format(append_str)],
+        depends_on=['AUTH_LDAP{}_GROUP_TYPE_PARAMS'.format(append_str),'AUTH_LDAP{}_GROUP_SEARCH'.format(append_str)],
     )
 
     register(
