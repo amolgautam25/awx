@@ -1546,9 +1546,4 @@ class UnifiedJob(PolymorphicModel, PasswordFieldsModel, CommonModelNameNotUnique
 
     @property
     def ancestor_job(self):
-        ancestor_job = self.get_workflow_job()
-        if ancestor_job is not None:
-            while ancestor_job.get_workflow_job() is not None:
-                ancestor_job = ancestor_job.get_workflow_job()
-            return ancestor_job
-        return self
+        return self.get_workflow_job().ancestor_job if self.spawned_by_workflow else self
