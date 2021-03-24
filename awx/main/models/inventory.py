@@ -598,8 +598,17 @@ class Host(CommonModelNameNotUnique, RelatedJobsMixin):
 
 class HostMetrics(models.Model):
     hostname = models.CharField(primary_key=True, max_length=512)
-    first_automation = now()
+    first_automation = models.DateTimeField(auto_now_add=True, null=False)
     last_automation = models.DateTimeField()
+
+    def host_metrics_update(self, hostname):
+        print("this will update host_metrics_database")
+
+    def host_metrics_view(self):
+        print("this will display all data in the model/db")
+
+    def host_metrics_create(self, hostname):
+        print("this will add data to model/db")
 
 
 class Group(CommonModelNameNotUnique, RelatedJobsMixin):

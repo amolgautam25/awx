@@ -19,6 +19,8 @@ from awx.main.fields import JSONField
 from awx.main.models.base import CreatedModifiedModel
 from awx.main.utils import ignore_inventory_computed_fields, camelcase_to_underscore
 
+import sdb
+
 analytics_logger = logging.getLogger('awx.analytics.job_events')
 
 logger = logging.getLogger('awx.main.models.events')
@@ -499,6 +501,7 @@ class JobEvent(BasePlaybookEvent):
         return hostnames
 
     def _update_host_summary_from_stats(self, hostnames):
+        sdb.set_trace()
         with ignore_inventory_computed_fields():
             try:
                 if not self.job or not self.job.inventory:
@@ -510,6 +513,7 @@ class JobEvent(BasePlaybookEvent):
             job = self.job
 
             from awx.main.models import Host, JobHostSummary  # circular import
+            from awx.main.models import HostMetrics
 
             all_hosts = Host.objects.filter(pk__in=self.host_map.values()).only('id')
             existing_host_ids = set(h.id for h in all_hosts)
@@ -545,6 +549,13 @@ class JobEvent(BasePlaybookEvent):
                     updated_hosts.add(h)
 
             Host.objects.bulk_update(list(updated_hosts), ['last_job_id', 'last_job_host_summary_id'], batch_size=100)
+
+            dt = now()
+            HostMetrics.objects.filter(hostname_in=list_of_hostnames_from_playbook_on_stats).update(last_automation=dt)
+
+            HostMetrics.objects.on_conflict(['hostname'], ConflictAction.NOTHING).bulk_create(
+                [HostMetrics(hostname=hostname, last_automation=dt) for hostname in list_of_hostnames_from_playbook_on_stats]
+            )
 
     @property
     def job_verbosity(self):
