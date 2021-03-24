@@ -596,6 +596,12 @@ class Host(CommonModelNameNotUnique, RelatedJobsMixin):
         return self.inventory._get_related_jobs()
 
 
+class HostMetrics(models.Model):
+    hostname = models.CharField(primary_key=True, max_length=512)
+    first_automation = now()
+    last_automation = models.DateTimeField()
+
+
 class Group(CommonModelNameNotUnique, RelatedJobsMixin):
     """
     A group containing managed hosts.  A group or host may belong to multiple
