@@ -539,23 +539,20 @@ class JobEvent(BasePlaybookEvent):
             # in single queries
             host_mapping = dict((summary['host_id'], summary['id']) for summary in JobHostSummary.objects.filter(job_id=job.id).values('id', 'host_id'))
             updated_hosts = set()
+            updated_hosts_list = []
             for h in all_hosts:
                 # if the hostname *shows up* in the playbook_on_stats event
                 if h.name in hostnames:
                     h.last_job_id = job.id
                     updated_hosts.add(h)
+                    updated_hosts.append(h.name)
                 if h.id in host_mapping:
                     h.last_job_host_summary_id = host_mapping[h.id]
                     updated_hosts.add(h)
 
             Host.objects.bulk_update(list(updated_hosts), ['last_job_id', 'last_job_host_summary_id'], batch_size=100)
 
-            dt = now()
-            HostMetrics.objects.filter(hostname_in=list_of_hostnames_from_playbook_on_stats).update(last_automation=dt)
-
-            HostMetrics.objects.on_conflict(['hostname'], ConflictAction.NOTHING).bulk_create(
-                [HostMetrics(hostname=hostname, last_automation=dt) for hostname in list_of_hostnames_from_playbook_on_stats]
-            )
+            HostMetric.objects.bulk_create([HostMetric(hostname=hostname, last_automation=dt) for hostname in updated_hosts_list], ignore_conflicts=True)
 
     @property
     def job_verbosity(self):
