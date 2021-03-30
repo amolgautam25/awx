@@ -509,7 +509,7 @@ class JobEvent(BasePlaybookEvent):
                 return
             job = self.job
 
-            from awx.main.models import Host, JobHostSummary  # circular import
+            from awx.main.models import Host, JobHostSummary, HostMetrics  # circular import
 
             all_hosts = Host.objects.filter(pk__in=self.host_map.values()).only('id')
             existing_host_ids = set(h.id for h in all_hosts)
@@ -545,6 +545,17 @@ class JobEvent(BasePlaybookEvent):
                     updated_hosts.add(h)
 
             Host.objects.bulk_update(list(updated_hosts), ['last_job_id', 'last_job_host_summary_id'], batch_size=100)
+
+            updated_hosts_list = list()
+            for host in updated_hosts:
+                updated_hosts_list.append(host.name)
+
+            # bulk-create
+            current_time = now()
+            HostMetrics.objects.bulk_create(
+                [HostMetrics(hostname=hostname, last_automation=current_time) for hostname in updated_hosts_list], ignore_conflicts=True
+            )
+            HostMetrics.objects.filter(hostname__in=updated_hosts_list).update(last_automation=current_time)
 
     @property
     def job_verbosity(self):
