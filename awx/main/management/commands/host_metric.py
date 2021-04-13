@@ -1,5 +1,4 @@
 from django.core.management.base import BaseCommand
-from dateutil import parser
 import datetime
 from django.core.serializers.json import DjangoJSONEncoder
 from awx.main.models.inventory import HostMetric
