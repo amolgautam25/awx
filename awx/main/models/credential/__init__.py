@@ -1023,7 +1023,7 @@ ManagedCredentialType(
                 'label': ugettext_noop('Username'),
                 'type': 'string',
                 'help_text': ugettext_noop(
-                    'Red Hat Ansible Automation Platform user to authenticate as.' 'This should not be set if an OAuth token is being used.'
+                    'Red Hat Ansible Automation Platform user id to authenticate as.' 'This should not be set if an OAuth token is being used.'
                 ),
             },
             {
