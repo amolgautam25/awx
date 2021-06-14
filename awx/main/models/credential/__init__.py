@@ -1050,11 +1050,6 @@ ManagedCredentialType(
             'TOWER_PASSWORD': '{{password}}',
             'TOWER_VERIFY_SSL': '{{verify_ssl}}',
             'TOWER_OAUTH_TOKEN': '{{oauth_token}}',
-            'CONTROLLER_HOST': '{{host}}',
-            'CONTROLLER_USERNAME': '{{username}}',
-            'CONTROLLER_PASSWORD': '{{password}}',
-            'CONTROLLER_VERIFY_SSL': '{{verify_ssl}}',
-            'CONTROLLER_OAUTH_TOKEN': '{{oauth_token}}',
         }
     },
 )
