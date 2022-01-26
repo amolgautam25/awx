@@ -411,9 +411,9 @@ class AWXReceptorJob:
             streamer='process',
             quiet=True,
             _input=resultfile,
-            event_handler=self.task.event_handler,
-            finished_callback=self.task.finished_callback,
-            status_handler=self.task.status_handler,
+            event_handler=self.task.runner_callback.event_handler,
+            finished_callback=self.task.runner_callback.finished_callback,
+            status_handler=self.task.runner_callback.status_handler,
             **self.runner_params,
         )
 
