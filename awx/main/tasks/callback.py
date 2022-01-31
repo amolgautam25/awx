@@ -189,5 +189,6 @@ class RunnerCallbackForProjectUpdate(RunnerCallback):
             if 'scm_version' in returned_facts:
                 self.playbook_new_revision = returned_facts['scm_version']
 
+
 class RunnerCallbackForInventoryUpdate(RunnerCallback):
     pass
