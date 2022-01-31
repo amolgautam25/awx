@@ -188,3 +188,6 @@ class RunnerCallbackForProjectUpdate(RunnerCallback):
             returned_facts = returned_data.get('res', {}).get('ansible_facts', {})
             if 'scm_version' in returned_facts:
                 self.playbook_new_revision = returned_facts['scm_version']
+
+class RunnerCallbackForInventoryUpdate(RunnerCallback):
+    pass
