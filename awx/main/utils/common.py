@@ -6,22 +6,26 @@ from datetime import timedelta
 import json
 import yaml
 import logging
+import psycopg
 import os
 import subprocess
 import re
 import stat
+import sys
 import urllib.parse
 import threading
 import contextlib
 import tempfile
-from functools import reduce, wraps
+import functools
+from importlib.metadata import version as _get_version
+from importlib.metadata import entry_points, EntryPoint
 
 # Django
 from django.core.exceptions import ObjectDoesNotExist, FieldDoesNotExist
 from django.utils.dateparse import parse_datetime
 from django.utils.translation import gettext_lazy as _
 from django.utils.functional import cached_property
-from django.db import connection, transaction, ProgrammingError
+from django.db import connection, DatabaseError, transaction, ProgrammingError, IntegrityError
 from django.db.models.fields.related import ForeignObjectRel, ManyToManyField
 from django.db.models.fields.related_descriptors import ForwardManyToOneDescriptor, ManyToManyDescriptor
 from django.db.models.query import QuerySet
@@ -39,6 +43,9 @@ from django.apps import apps
 # AWX
 from awx.conf.license import get_license
 
+# ansible-runner
+from ansible_runner.utils.capacity import get_mem_in_bytes, get_cpu_count
+
 logger = logging.getLogger('awx.main.utils')
 
 __all__ = [
@@ -50,12 +57,10 @@ __all__ = [
     'get_awx_http_client_headers',
     'get_awx_version',
     'update_scm_url',
-    'get_type_for_model',
     'get_model_for_type',
     'copy_model_by_class',
     'copy_m2m_relationships',
     'prefetch_page_capabilities',
-    'to_python_boolean',
     'datetime_hook',
     'ignore_inventory_computed_fields',
     'ignore_inventory_group_removal',
@@ -72,20 +77,22 @@ __all__ = [
     'NullablePromptPseudoField',
     'model_instance_diff',
     'parse_yaml_or_json',
+    'is_testing',
     'RequireDebugTrueOrTest',
     'has_model_field_prefetched',
     'set_environ',
     'IllegalArgumentError',
     'get_custom_venv_choices',
-    'get_external_account',
-    'task_manager_bulk_reschedule',
-    'schedule_task_manager',
+    'ScheduleTaskManager',
+    'ScheduleDependencyManager',
+    'ScheduleWorkflowManager',
     'classproperty',
     'create_temporary_fifo',
     'truncate_stdout',
     'deepmerge',
     'get_event_partition_epoch',
     'cleanup_new_process',
+    'unified_job_class_to_event_table_name',
 ]
 
 
@@ -103,18 +110,6 @@ def get_object_or_400(klass, *args, **kwargs):
         raise ParseError(*e.args)
     except queryset.model.MultipleObjectsReturned as e:
         raise ParseError(*e.args)
-
-
-def to_python_boolean(value, allow_none=False):
-    value = str(value)
-    if value.lower() in ('true', '1', 't'):
-        return True
-    elif value.lower() in ('false', '0', 'f'):
-        return False
-    elif allow_none and value.lower() in ('none', 'null'):
-        return None
-    else:
-        raise ValueError(_(u'Unable to convert "%s" to boolean') % value)
 
 
 def datetime_hook(d):
@@ -142,6 +137,27 @@ def underscore_to_camelcase(s):
     return ''.join(x.capitalize() or '_' for x in s.split('_'))
 
 
+@functools.cache
+def is_testing(argv=None):
+    '''Return True if running django or py.test unit tests.'''
+    if os.environ.get('DJANGO_SETTINGS_MODULE') == 'awx.main.tests.settings_for_test':
+        return True
+    argv = sys.argv if argv is None else argv
+    if len(argv) >= 1 and ('py.test' in argv[0] or 'py/test.py' in argv[0]):
+        return True
+    elif len(argv) >= 2 and argv[1] == 'test':
+        return True
+    return False
+
+
+def bypass_in_test(func):
+    def fn(*args, **kwargs):
+        if not is_testing():
+            return func(*args, **kwargs)
+
+    return fn
+
+
 class RequireDebugTrueOrTest(logging.Filter):
     """
     Logging filter to output when in DEBUG mode or running tests.
@@ -150,7 +166,7 @@ class RequireDebugTrueOrTest(logging.Filter):
     def filter(self, record):
         from django.conf import settings
 
-        return settings.DEBUG or settings.IS_TESTING()
+        return settings.DEBUG or is_testing()
 
 
 class IllegalArgumentError(ValueError):
@@ -172,7 +188,7 @@ def memoize(ttl=60, cache_key=None, track_function=False, cache=None):
     cache = cache or get_memoize_cache()
 
     def memoize_decorator(f):
-        @wraps(f)
+        @functools.wraps(f)
         def _memoizer(*args, **kwargs):
             if track_function:
                 cache_dict_key = slugify('%r %r' % (args, kwargs))
@@ -217,9 +233,7 @@ def get_awx_version():
     from awx import __version__
 
     try:
-        import pkg_resources
-
-        return pkg_resources.require('awx')[0].version
+        return _get_version('awx')
     except Exception:
         return __version__
 
@@ -262,9 +276,15 @@ def update_scm_url(scm_type, url, username=True, password=True, check_special_ca
                 userpass, hostpath = url.split('@', 1)
             else:
                 userpass, hostpath = '', url
-            if hostpath.count(':') > 1:
+            # Handle IPv6 here. In this case, we might have hostpath of:
+            # [fd00:1234:2345:6789::11]:example/foo.git
+            if hostpath.startswith('[') and ']:' in hostpath:
+                host, path = hostpath.split(']:', 1)
+                host = host + ']'
+            elif hostpath.count(':') > 1:
                 raise ValueError(_('Invalid %s URL') % scm_type)
-            host, path = hostpath.split(':', 1)
+            else:
+                host, path = hostpath.split(':', 1)
             # if not path.startswith('/') and not path.startswith('~/'):
             #    path = '~/%s' % path
             # if path.startswith('/'):
@@ -323,7 +343,11 @@ def update_scm_url(scm_type, url, username=True, password=True, check_special_ca
         netloc = u':'.join([urllib.parse.quote(x, safe='') for x in (netloc_username, netloc_password) if x])
     else:
         netloc = u''
-    netloc = u'@'.join(filter(None, [netloc, parts.hostname]))
+    # urllib.parse strips brackets from IPv6 addresses, so we need to add them back in
+    hostname = parts.hostname
+    if hostname and ':' in hostname and '[' in url and ']' in url:
+        hostname = f'[{hostname}]'
+    netloc = u'@'.join(filter(None, [netloc, hostname]))
     if parts.port:
         netloc = u':'.join([netloc, str(parts.port)])
     new_url = urllib.parse.urlunsplit([parts.scheme, netloc, parts.path, parts.query, parts.fragment])
@@ -333,14 +357,13 @@ def update_scm_url(scm_type, url, username=True, password=True, check_special_ca
 
 
 def get_allowed_fields(obj, serializer_mapping):
-
     if serializer_mapping is not None and obj.__class__ in serializer_mapping:
         serializer_actual = serializer_mapping[obj.__class__]()
         allowed_fields = [x for x in serializer_actual.fields if not serializer_actual.fields[x].read_only] + ['id']
     else:
         allowed_fields = [x.name for x in obj._meta.fields]
 
-    ACTIVITY_STREAM_FIELD_EXCLUSIONS = {'user': ['last_login'], 'oauth2accesstoken': ['last_used'], 'oauth2application': ['client_secret']}
+    ACTIVITY_STREAM_FIELD_EXCLUSIONS = {'user': ['last_login']}
     model_name = obj._meta.model_name
     fields_excluded = ACTIVITY_STREAM_FIELD_EXCLUSIONS.get(model_name, [])
     # see definition of from_db for CredentialType
@@ -530,20 +553,16 @@ def copy_m2m_relationships(obj1, obj2, fields, kwargs=None):
                 if kwargs and field_name in kwargs:
                     override_field_val = kwargs[field_name]
                     if isinstance(override_field_val, (set, list, QuerySet)):
+                        # Labels are additive so we are going to add any src labels in addition to the override labels
+                        if field_name == 'labels':
+                            for jt_label in src_field_value.all():
+                                getattr(obj2, field_name).add(jt_label.id)
                         getattr(obj2, field_name).add(*override_field_val)
                         continue
                     if override_field_val.__class__.__name__ == 'ManyRelatedManager':
                         src_field_value = override_field_val
                 dest_field = getattr(obj2, field_name)
                 dest_field.add(*list(src_field_value.all().values_list('id', flat=True)))
-
-
-def get_type_for_model(model):
-    """
-    Return type name for a given model class.
-    """
-    opts = model._meta.concrete_model._meta
-    return camelcase_to_underscore(opts.object_name)
 
 
 def get_model_for_type(type_name):
@@ -599,7 +618,6 @@ def prefetch_page_capabilities(model, page, prefetch_list, user):
         mapping[obj.id] = {}
 
     for prefetch_entry in prefetch_list:
-
         display_method = None
         if type(prefetch_entry) is dict:
             display_method = list(prefetch_entry.keys())[0]
@@ -687,7 +705,7 @@ def parse_yaml_or_json(vars_str, silent_failure=True):
             if silent_failure:
                 return {}
             raise ParseError(
-                _('Cannot parse as JSON (error: {json_error}) or ' 'YAML (error: {yaml_error}).').format(json_error=str(json_err), yaml_error=str(yaml_err))
+                _('Cannot parse as JSON (error: {json_error}) or YAML (error: {yaml_error}).').format(json_error=str(json_err), yaml_error=str(yaml_err))
             )
     return vars_dict
 
@@ -738,14 +756,13 @@ def get_corrected_cpu(cpu_count):  # formerlly get_cpu_capacity
     return cpu_count  # no correction
 
 
-def get_cpu_effective_capacity(cpu_count):
+def get_cpu_effective_capacity(cpu_count, is_control_node=False):
     from django.conf import settings
-
-    cpu_count = get_corrected_cpu(cpu_count)
 
     settings_forkcpu = getattr(settings, 'SYSTEM_TASK_FORKS_CPU', None)
     env_forkcpu = os.getenv('SYSTEM_TASK_FORKS_CPU', None)
-
+    if is_control_node:
+        cpu_count = get_corrected_cpu(cpu_count)
     if env_forkcpu:
         forkcpu = int(env_forkcpu)
     elif settings_forkcpu:
@@ -804,6 +821,7 @@ def get_corrected_memory(memory):
 
     # Runner returns memory in bytes
     # so we convert memory from settings to bytes as well.
+
     if env_absmem is not None:
         return convert_mem_str_to_bytes(env_absmem)
     elif settings_absmem is not None:
@@ -812,14 +830,13 @@ def get_corrected_memory(memory):
     return memory
 
 
-def get_mem_effective_capacity(mem_bytes):
+def get_mem_effective_capacity(mem_bytes, is_control_node=False):
     from django.conf import settings
-
-    mem_bytes = get_corrected_memory(mem_bytes)
 
     settings_mem_mb_per_fork = getattr(settings, 'SYSTEM_TASK_FORKS_MEM', None)
     env_mem_mb_per_fork = os.getenv('SYSTEM_TASK_FORKS_MEM', None)
-
+    if is_control_node:
+        mem_bytes = get_corrected_memory(mem_bytes)
     if env_mem_mb_per_fork:
         mem_mb_per_fork = int(env_mem_mb_per_fork)
     elif settings_mem_mb_per_fork:
@@ -846,6 +863,66 @@ def get_mem_effective_capacity(mem_bytes):
 
 _inventory_updates = threading.local()
 _task_manager = threading.local()
+_dependency_manager = threading.local()
+_workflow_manager = threading.local()
+
+
+@contextlib.contextmanager
+def task_manager_bulk_reschedule():
+    managers = [ScheduleTaskManager(), ScheduleWorkflowManager(), ScheduleDependencyManager()]
+    """Context manager to avoid submitting task multiple times."""
+    try:
+        for m in managers:
+            m.previous_flag = getattr(m.manager_threading_local, 'bulk_reschedule', False)
+            m.previous_value = getattr(m.manager_threading_local, 'needs_scheduling', False)
+            m.manager_threading_local.bulk_reschedule = True
+            m.manager_threading_local.needs_scheduling = False
+        yield
+    finally:
+        for m in managers:
+            m.manager_threading_local.bulk_reschedule = m.previous_flag
+            if m.manager_threading_local.needs_scheduling:
+                m.schedule()
+            m.manager_threading_local.needs_scheduling = m.previous_value
+
+
+class ScheduleManager:
+    def __init__(self, manager, manager_threading_local):
+        self.manager = manager
+        self.manager_threading_local = manager_threading_local
+
+    def _schedule(self):
+        from django.db import connection
+
+        # runs right away if not in transaction
+        connection.on_commit(lambda: self.manager.delay())
+
+    def schedule(self):
+        if getattr(self.manager_threading_local, 'bulk_reschedule', False):
+            self.manager_threading_local.needs_scheduling = True
+            return
+        self._schedule()
+
+
+class ScheduleTaskManager(ScheduleManager):
+    def __init__(self):
+        from awx.main.scheduler.tasks import task_manager
+
+        super().__init__(task_manager, _task_manager)
+
+
+class ScheduleDependencyManager(ScheduleManager):
+    def __init__(self):
+        from awx.main.scheduler.tasks import dependency_manager
+
+        super().__init__(dependency_manager, _dependency_manager)
+
+
+class ScheduleWorkflowManager(ScheduleManager):
+    def __init__(self):
+        from awx.main.scheduler.tasks import workflow_manager
+
+        super().__init__(workflow_manager, _workflow_manager)
 
 
 @contextlib.contextmanager
@@ -859,37 +936,6 @@ def ignore_inventory_computed_fields():
         yield
     finally:
         _inventory_updates.is_updating = previous_value
-
-
-def _schedule_task_manager():
-    from awx.main.scheduler.tasks import run_task_manager
-    from django.db import connection
-
-    # runs right away if not in transaction
-    connection.on_commit(lambda: run_task_manager.delay())
-
-
-@contextlib.contextmanager
-def task_manager_bulk_reschedule():
-    """Context manager to avoid submitting task multiple times."""
-    try:
-        previous_flag = getattr(_task_manager, 'bulk_reschedule', False)
-        previous_value = getattr(_task_manager, 'needs_scheduling', False)
-        _task_manager.bulk_reschedule = True
-        _task_manager.needs_scheduling = False
-        yield
-    finally:
-        _task_manager.bulk_reschedule = previous_flag
-        if _task_manager.needs_scheduling:
-            _schedule_task_manager()
-        _task_manager.needs_scheduling = previous_value
-
-
-def schedule_task_manager():
-    if getattr(_task_manager, 'bulk_reschedule', False):
-        _task_manager.needs_scheduling = True
-        return
-    _schedule_task_manager()
 
 
 @contextlib.contextmanager
@@ -947,16 +993,22 @@ def getattrd(obj, name, default=NoDefaultProvided):
     """
 
     try:
-        return reduce(getattr, name.split("."), obj)
+        return functools.reduce(getattr, name.split("."), obj)
     except AttributeError:
         if default != NoDefaultProvided:
             return default
         raise
 
 
-def getattr_dne(obj, name, notfound=ObjectDoesNotExist):
+empty = object()
+
+
+def getattr_dne(obj, name, default=empty, notfound=ObjectDoesNotExist):
     try:
-        return getattr(obj, name)
+        if default is empty:
+            return getattr(obj, name)
+        else:
+            return getattr(obj, name, default)
     except notfound:
         return None
 
@@ -1030,29 +1082,6 @@ def has_model_field_prefetched(model_obj, field_name):
     return getattr(getattr(model_obj, field_name, None), 'prefetch_cache_name', '') in getattr(model_obj, '_prefetched_objects_cache', {})
 
 
-def get_external_account(user):
-    from django.conf import settings
-
-    account_type = None
-    if getattr(settings, 'AUTH_LDAP_SERVER_URI', None):
-        try:
-            if user.pk and user.profile.ldap_dn and not user.has_usable_password():
-                account_type = "ldap"
-        except AttributeError:
-            pass
-    if (
-        getattr(settings, 'SOCIAL_AUTH_GOOGLE_OAUTH2_KEY', None)
-        or getattr(settings, 'SOCIAL_AUTH_GITHUB_KEY', None)
-        or getattr(settings, 'SOCIAL_AUTH_GITHUB_ORG_KEY', None)
-        or getattr(settings, 'SOCIAL_AUTH_GITHUB_TEAM_KEY', None)
-        or getattr(settings, 'SOCIAL_AUTH_SAML_ENABLED_IDPS', None)
-    ) and user.social_auth.all():
-        account_type = "social"
-    if (getattr(settings, 'RADIUS_SERVER', None) or getattr(settings, 'TACACSPLUS_HOST', None)) and user.enterprise_auth.all():
-        account_type = "enterprise"
-    return account_type
-
-
 class classproperty:
     def __init__(self, fget=None, fset=None, fdel=None, doc=None):
         self.fget = fget
@@ -1075,7 +1104,11 @@ def create_temporary_fifo(data):
     path = os.path.join(tempfile.mkdtemp(), next(tempfile._get_candidate_names()))
     os.mkfifo(path, stat.S_IRUSR | stat.S_IWUSR)
 
-    threading.Thread(target=lambda p, d: open(p, 'wb').write(d), args=(path, data)).start()
+    def tmp_write(path, data):
+        with open(path, 'wb') as f:
+            f.write(data)
+
+    threading.Thread(target=tmp_write, args=(path, data)).start()
     return path
 
 
@@ -1113,44 +1146,64 @@ def deepmerge(a, b):
         return b
 
 
-def create_partition(tblname, start=None, end=None, partition_label=None, minutely=False):
-    """Creates new partition table for events.
-    - start defaults to beginning of current hour
-    - end defaults to end of current hour
-    - partition_label defaults to YYYYMMDD_HH
+def table_exists(cursor, table_name):
+    cursor.execute(f"SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = '{table_name}');")
+    row = cursor.fetchone()
+    if row is not None:
+        for val in row:  # should only have 1
+            if val is True:
+                logger.debug(f'Event partition table {table_name} already exists')
+                return True
+    return False
 
-    - minutely will create partitions that span _a single minute_ for testing purposes
-    """
-    current_time = now()
-    if not start:
-        if minutely:
-            start = current_time.replace(microsecond=0, second=0)
-        else:
-            start = current_time.replace(microsecond=0, second=0, minute=0)
-    if not end:
-        if minutely:
-            end = start.replace(microsecond=0, second=0) + timedelta(minutes=1)
-        else:
-            end = start.replace(microsecond=0, second=0, minute=0) + timedelta(hours=1)
+
+def create_partition(tblname, start=None):
+    """Creates new partition table for events.  By default it covers the current hour."""
+    if start is None:
+        start = now()
+
+    start = start.replace(microsecond=0, second=0, minute=0)
+    end = start + timedelta(hours=1)
+
     start_timestamp = str(start)
     end_timestamp = str(end)
 
-    if not partition_label:
-        if minutely:
-            partition_label = start.strftime('%Y%m%d_%H%M')
-        else:
-            partition_label = start.strftime('%Y%m%d_%H')
+    partition_label = start.strftime('%Y%m%d_%H')
 
     try:
         with transaction.atomic():
             with connection.cursor() as cursor:
+                if table_exists(cursor, f"{tblname}_{partition_label}"):
+                    return
+
                 cursor.execute(
-                    f'CREATE TABLE IF NOT EXISTS {tblname}_{partition_label} '
-                    f'PARTITION OF {tblname} '
-                    f'FOR VALUES FROM (\'{start_timestamp}\') to (\'{end_timestamp}\');'
+                    f'CREATE TABLE {tblname}_{partition_label} (LIKE {tblname} INCLUDING DEFAULTS INCLUDING CONSTRAINTS); '
+                    f'ALTER TABLE {tblname} ATTACH PARTITION {tblname}_{partition_label} '
+                    f'FOR VALUES FROM (\'{start_timestamp}\') TO (\'{end_timestamp}\');'
                 )
-    except ProgrammingError as e:
-        logger.debug(f'Caught known error due to existing partition: {e}')
+
+    except (ProgrammingError, IntegrityError) as e:
+        cause = e.__cause__
+        if cause and hasattr(cause, 'sqlstate'):
+            sqlstate = cause.sqlstate
+            if sqlstate is None:
+                raise
+            sqlstate_cls = psycopg.errors.lookup(sqlstate)
+
+            if sqlstate_cls in (psycopg.errors.DuplicateTable, psycopg.errors.DuplicateObject, psycopg.errors.UniqueViolation):
+                logger.info(f'Caught known error due to partition creation race: {e}')
+            else:
+                logger.error('SQL Error state: {} - {}'.format(sqlstate, sqlstate_cls))
+                raise
+    except DatabaseError as e:
+        cause = e.__cause__
+        if cause and hasattr(cause, 'sqlstate'):
+            sqlstate = cause.sqlstate
+            if sqlstate is None:
+                raise
+            sqlstate_str = psycopg.errors.lookup(sqlstate)
+            logger.error('SQL Error state: {} - {}'.format(sqlstate, sqlstate_str))
+        raise
 
 
 def cleanup_new_process(func):
@@ -1158,7 +1211,7 @@ def cleanup_new_process(func):
     Cleanup django connection, cache connection, before executing new thread or processes entry point, func.
     """
 
-    @wraps(func)
+    @functools.wraps(func)
     def wrapper_cleanup_new_process(*args, **kwargs):
         from awx.conf.settings import SettingsWrapper  # noqa
 
@@ -1168,3 +1221,46 @@ def cleanup_new_process(func):
         return func(*args, **kwargs)
 
     return wrapper_cleanup_new_process
+
+
+def unified_job_class_to_event_table_name(job_class):
+    return f'main_{job_class().event_class.__name__.lower()}'
+
+
+def load_all_entry_points_for(entry_point_subsections: list[str], /) -> dict[str, EntryPoint]:
+    return {ep.name: ep for entry_point_category in entry_point_subsections for ep in entry_points(group=f'awx_plugins.{entry_point_category}')}
+
+
+def get_auto_max_workers():
+    """Method we normally rely on to get max_workers
+
+    Uses almost same logic as Instance.local_health_check
+    The important thing is to be MORE than Instance.capacity
+    so that the task-manager does not over-schedule this node
+
+    Ideally we would just use the capacity from the database plus reserve workers,
+    but this poses some bootstrap problems where OCP task containers
+    register themselves after startup
+    """
+    # Get memory from ansible-runner
+    total_memory_gb = get_mem_in_bytes()
+
+    # This may replace memory calculation with a user override
+    corrected_memory = get_corrected_memory(total_memory_gb)
+
+    # Get same number as max forks based on memory, this function takes memory as bytes
+    mem_capacity = get_mem_effective_capacity(corrected_memory, is_control_node=True)
+
+    # Follow same process for CPU capacity constraint
+    cpu_count = get_cpu_count()
+    corrected_cpu = get_corrected_cpu(cpu_count)
+    cpu_capacity = get_cpu_effective_capacity(corrected_cpu, is_control_node=True)
+
+    # Here is what is different from health checks,
+    auto_max = max(mem_capacity, cpu_capacity)
+
+    # add magic number of extra workers to ensure
+    # we have a few extra workers to run the heartbeat
+    auto_max += 7
+
+    return auto_max

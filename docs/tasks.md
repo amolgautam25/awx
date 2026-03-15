@@ -20,6 +20,19 @@ In this document, we will go into a bit of detail about how and when AWX runs Py
     - Every node in an AWX cluster runs a periodic task that serves as
       a heartbeat and capacity check
 
+dispatcherd Library
+-------------------
+
+The task system logic has been split out into a separate library:
+
+https://github.com/ansible/dispatcherd
+
+AWX now uses dispatcherd directly for all task management. Tasks are decorated using:
+
+```python
+from dispatcherd.publish import task
+```
+
 
 Tasks, Queues and Workers
 ----------------
@@ -60,7 +73,7 @@ Defining and Running Tasks
 Tasks are defined in AWX's source code, and generally live in the
 `awx.main.tasks` module.  Tasks can be defined as simple functions:
 
-    from awx.main.dispatch.publish import task
+    from dispatcherd.publish import task
 
     @task()
     def add(a, b):
@@ -97,7 +110,7 @@ associated Python code:
 
 Dispatcher Implementation
 -------------------------
-Every node in an AWX install runs `awx-manage run_dispatcher`, a Python process
+Every node in an AWX install runs `awx-manage dispatcherd`, a Python process
 that uses the `kombu` library to consume messages from the appropriate queues
 for that node (the default shared queue, a queue specific to the node's
 hostname, and the broadcast queue).  The Dispatcher process manages a pool of
@@ -108,11 +121,11 @@ the associated Python code.
 
 Debugging
 ---------
-`awx-manage run_dispatcher` includes a few flags that allow interaction and
+`awx-manage dispatcherctl` includes a few flags that allow interaction and
 debugging:
 
 ```
-[root@awx /]# awx-manage run_dispatcher --status
+[root@awx /]# awx-manage dispatcherctl status
 2018-09-14 18:39:22,223 WARNING  awx.main.dispatch checking dispatcher status for awx
 awx[pid:9610] workers total=4 min=4 max=60
 .  worker[pid:9758] sent=12 finished=12 qsize=0 rss=106.730MB [IDLE]
@@ -126,17 +139,9 @@ This outputs running and queued task UUIDs handled by a specific dispatcher
 (which corresponds to `main_unifiedjob.celery_task_id` in the database):
 
 ```
-[root@awx /]# awx-manage run_dispatcher --running
+[root@awx /]# awx-manage dispatcherctl running
 2018-09-14 18:39:22,223 WARNING  awx.main.dispatch checking dispatcher running for awx
 ['eb3b0a83-86da-413d-902a-16d7530a6b25', 'f447266a-23da-42b4-8025-fe379d2db96f']
-```
-
-Additionally, you can tell the local running dispatcher to recycle all of the
-workers in its pool.  It will wait for any running jobs to finish and exit when
-work has completed, spinning up replacement workers.
-
-```
-awx-manage run_dispatcher --reload
 ```
 
 * * *
@@ -187,14 +192,14 @@ This task spawns an `ansible` process, which then runs a command using Ansible. 
 - Build a command line argument list for running Ansible, optionally using `ssh-agent` for public/private key authentication.
 - Return whether the task should use process isolation.
 
-For more information on ad hoc commands, read the [Running Ad Hoc Commands section](https://docs.ansible.com/ansible-tower/latest/html/userguide/inventories.html#running-ad-hoc-commands) of the Inventories page of the Ansible Tower User Guide.
+For more information on ad hoc commands, read the [Running Ad Hoc Commands section](https://ansible.readthedocs.io/projects/awx/en/latest/userguide/inventories.html#running-ad-hoc-commands) of the Inventories chapter of _Automating with AWX_ guide.
 
 
 #### Run Job
 
 This task is a definition and set of parameters for running `ansible-playbook` via a Job Template. It defines metadata about a given playbook run, such as a named identifier, an associated inventory to run against, the project and `.yml` playbook file to run, etc.
 
-For more information, visit the [Jobs page](https://docs.ansible.com/ansible-tower/latest/html/userguide/jobs.html) of the Ansible Tower User Guide.
+For more information, visit the [Jobs chapter](https://ansible.readthedocs.io/projects/awx/en/latest/userguide/jobs.html) of the _Automating with AWX_ guide.
 
 
 #### Run Project Update
@@ -203,7 +208,7 @@ When a Project Update is run in AWX, an `ansible-playbook` command is composed a
 
 This task also includes a helper method to build SCM url and extra vars with parameters needed for authentication, as well as a method for returning search/replace strings to prevent output URLs from showing sensitive passwords.
 
-To read more about this topic, visit the [Projects page](https://docs.ansible.com/ansible-tower/latest/html/userguide/projects.html) of the Ansible Tower User Guide.
+To read more about this topic, visit the [Projects chapter](https://ansible.readthedocs.io/projects/awx/en/latest/userguide/projects.html) of the _Automating with AWX_ guide.
 
 
 #### Run Inventory Update
@@ -214,14 +219,14 @@ In older versions of AWX, the `INI` files were not exclusive for either specific
 
 Additionally, inventory imports are run through a management command. Inventory in `args` get passed to that command, which results in it not being considered to be an Ansible inventory by Runner even though it is.
 
-To read more about inventories, visit the [Inventories page](https://docs.ansible.com/ansible-tower/latest/html/userguide/inventories.html) of the Ansible Tower User Guide. For more detail about Runner, visit the [Ansible Runner Integration Overview](https://github.com/ansible/awx/blob/devel/docs/ansible_runner_integration.md) AWX documentation page.
+To read more about inventories, visit the [Inventories chapter](https://ansible.readthedocs.io/projects/awx/en/latest/userguide/inventories.html) of the _Automating with AWX_ guide. For more detail about Runner, visit the [Ansible Runner Integration Overview](https://github.com/ansible/awx/blob/devel/docs/ansible_runner_integration.md) AWX documentation page.
 
 
 #### System Jobs
 
 The main distinctive feature of a System Job (as compared to all other Unified Jobs) is that a system job runs management commands, which are given the highest priority for execution hierarchy purposes. They also implement a database lock while running, _i.e._, no other jobs can be run during that time on the same node. Additionally, they have a fixed fork impact of 5 vs 1.
 
-You can read more about [Ansible Tower Capacity Determination and Job Impact](https://docs.ansible.com/ansible-tower/latest/html/userguide/jobs.html#at-capacity-determination-and-job-impact) in the Jobs section of the Ansible Tower User Guide.
+You can read more about [Ansible Tower Capacity Determination and Job Impact](https://ansible.readthedocs.io/projects/awx/en/latest/userguide/jobs.html#awx-capacity-determination-and-job-impact) in the Jobs chapter of the _Automating with AWX_ guide.
 
 
 ### Periodic Background Tasks
@@ -247,7 +252,7 @@ The `smart_inventories` field in AWX uses a membership lookup table that identif
 
 An important thing to note is that this task is only run if the `AWX_REBUILD_SMART_MEMBERSHIP` is set to `True` (default is `False`).
 
-For more information, visit the [Smart Inventories section](https://docs.ansible.com/ansible-tower/latest/html/userguide/inventories.html#smart-inventories) of the Tower User Guide's "Inventory" page or the AWX documentation page [Inventory Refresh Overview page](https://github.com/ansible/awx/blob/devel/docs/inventory_refresh.md#inventory-changes) in this repo.
+For more information, visit the [Smart Inventories section](https://ansible.readthedocs.io/projects/awx/en/latest/userguide/inventories.html#smart-inventories) of the Inventories chapter of the _Automating with AWX_ guide.
 
 
 #### Deep Copy Model Object
@@ -277,7 +282,7 @@ This task allows the user to turn on a global profiler in their system, so that 
 
 The analytics collection `gather()` and `ship()` functions are called by an `awx-manage gather_analytics --ship` command, which runs on whichever instance it is invoked on. When these functions are called by Celery beat (currently at midnight local time), it is run on one `execution_node` by the Python in the AWX virtualenv.
 
-For more details about analytics, please visit the [Usability Analytics and Data Collection](https://docs.ansible.com/ansible-tower/latest/html/administration/usability_data_collection.html) page.
+For more details about analytics, please visit the [Analytics gathering](https://ansible.readthedocs.io/projects/awx/en/latest/administration/awx-manage.html#analytics-gathering) section of the _Administering AWX Deployments_ guide.
 
 
 #### Run Administrative Checks
@@ -308,4 +313,4 @@ When a user creates a notification template in `/api/v2/notification_templates`,
 
 Notifications assigned at certain levels will inherit traits defined on parent objects in different ways.  For example, ad hoc commands will use notifications defined on the Organization that the inventory is associated with.
 
-For more details on notifications, visit the [Notifications page](https://docs.ansible.com/ansible-tower/3.4.3/html/userguide/notifications.html) of the Tower user guide, or the AWX documentation on [Notification System Overview](https://github.com/ansible/awx/blob/devel/docs/notification_system.md) in this repository.
+For more details on notifications, visit the [Notifications chapter](hhttps://ansible.readthedocs.io/projects/awx/en/latest/userguide/notifications.html) of the _Automating with AWX_ guide.

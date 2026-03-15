@@ -11,9 +11,9 @@ from awxkit.utils import PseudoNamespace, is_relative_endpoint, are_same_endpoin
 from awxkit.api import utils
 from awxkit.api.client import Connection
 from awxkit.api.registry import URLRegistry
+from awxkit.api.resources import resources
 from awxkit.config import config
 import awxkit.exceptions as exc
-
 
 log = logging.getLogger(__name__)
 
@@ -89,7 +89,6 @@ def objectify_response_json(response):
 
 
 class Page(object):
-
     endpoint = ''
 
     def __init__(self, connection=None, *a, **kw):
@@ -154,6 +153,26 @@ class Page(object):
         resp.status_code = 200
         return cls(r=resp, connection=connection)
 
+    @property
+    def bytes(self):
+        if self.r is None:
+            return b''
+        return self.r.content
+
+    def extract_data(self, response):
+        """Takes a `requests.Response` and returns a data dict."""
+        try:
+            data = response.json()
+        except ValueError as e:  # If there was no json to parse
+            data = {}
+            if response.text or response.status_code not in (200, 202, 204):
+                text = response.text
+                if len(text) > 1024:
+                    text = text[:1024] + '... <<< Truncated >>> ...'
+                log.debug("Unable to parse JSON response ({0.status_code}): {1} - '{2}'".format(response, e, text))
+
+        return data
+
     def page_identity(self, response, request_json=None):
         """Takes a `requests.Response` and
         returns a new __item_class__ instance if the request method is not a get, or returns
@@ -171,16 +190,7 @@ class Page(object):
         else:
             ds = None
 
-        try:
-            data = response.json()
-        except ValueError as e:  # If there was no json to parse
-            data = dict()
-            if response.text or response.status_code not in (200, 202, 204):
-                text = response.text
-                if len(text) > 1024:
-                    text = text[:1024] + '... <<< Truncated >>> ...'
-                log.debug("Unable to parse JSON response ({0.status_code}): {1} - '{2}'".format(response, e, text))
-
+        data = self.extract_data(response)
         exc_str = "%s (%s) received" % (http.responses[response.status_code], response.status_code)
 
         exception = exception_from_status_code(response.status_code)
@@ -188,7 +198,6 @@ class Page(object):
             raise exception(exc_str, data)
 
         if response.status_code in (http.OK, http.CREATED, http.ACCEPTED):
-
             # Not all JSON responses include a URL.  Grab it from the request
             # object, if needed.
             if 'url' in data:
@@ -326,7 +335,6 @@ def exception_from_status_code(status_code):
 
 
 class PageList(object):
-
     NATURAL_KEY = None
 
     @property
@@ -485,10 +493,11 @@ class TentativePage(str):
 
 
 class PageCache(object):
-    def __init__(self):
+    def __init__(self, connection=None):
         self.options = {}
         self.pages_by_url = {}
         self.pages_by_natural_key = {}
+        self.connection = connection or Connection(config.base_url, not config.assume_untrusted)
 
     def get_options(self, page):
         url = page.endpoint if isinstance(page, Page) else str(page)
@@ -542,7 +551,31 @@ class PageCache(object):
         return self.set_page(page)
 
     def get_by_natural_key(self, natural_key):
-        endpoint = self.pages_by_natural_key.get(utils.freeze(natural_key))
-        log.debug("get_by_natural_key: %s, endpoint: %s", repr(natural_key), endpoint)
-        if endpoint:
-            return self.get_page(endpoint)
+        page = self.pages_by_natural_key.get(utils.freeze(natural_key))
+        if page is None:
+            # We need some way to get ahold of the top-level resource
+            # list endpoint from the natural_key type.  The resources
+            # object more or less has that for each of the detail
+            # views.  Just chop off the /<id>/ bit.
+            endpoint = getattr(resources, natural_key['type'], None)
+            if endpoint is None:
+                return
+            endpoint = ''.join([endpoint.rsplit('/', 2)[0], '/'])
+            page_type = get_registered_page(endpoint)
+
+            kwargs = {}
+            for k, v in natural_key.items():
+                if isinstance(v, str) and k != 'type':
+                    kwargs[k] = v
+
+            # Do a filtered query against the list endpoint, usually
+            # with the name of the object but sometimes more.
+            list_page = page_type(self.connection, endpoint=endpoint).get(all_pages=True, **kwargs)
+            if 'results' in list_page:
+                for p in list_page.results:
+                    self.set_page(p)
+            page = self.pages_by_natural_key.get(utils.freeze(natural_key))
+
+        log.debug("get_by_natural_key: %s, endpoint: %s", repr(natural_key), page)
+        if page:
+            return self.get_page(page)

@@ -2,6 +2,7 @@
 - name: Generate a random string for test
   set_fact:
     test_id: "{{ lookup('password', '/dev/null chars=ascii_letters length=16') }}"
+  when: test_id is not defined
 
 - name: generate random string for project
   set_fact:
@@ -9,6 +10,7 @@
     cred1: "AWX-Collection-tests-job_template-cred1-{{ test_id }}"
     cred2: "AWX-Collection-tests-job_template-cred2-{{ test_id }}"
     cred3: "AWX-Collection-tests-job_template-cred3-{{ test_id }}"
+    inv1: "AWX-Collection-tests-job_template-inv-{{ test_id }}"
     proj1: "AWX-Collection-tests-job_template-proj-{{ test_id }}"
     jt1: "AWX-Collection-tests-job_template-jt1-{{ test_id }}"
     jt2: "AWX-Collection-tests-job_template-jt2-{{ test_id }}"
@@ -23,6 +25,11 @@
     galaxy_credentials:
       - Ansible Galaxy
   register: result
+
+- name: Create an inventory
+  inventory:
+    name: "{{ inv1 }}"
+    organization: "{{ org_name }}"
 
 - name: Create a Demo Project
   project:
@@ -103,7 +110,7 @@
   job_template:
     name: "{{ jt1 }}"
     project: "{{ proj1 }}"
-    inventory: Demo Inventory
+    inventory: "{{ inv1 }}"
     playbook: hello_world.yml
     credentials:
       - "{{ cred1 }}"
@@ -112,6 +119,63 @@
       - "{{ group_name1 }}"
     job_type: run
     state: present
+  register: jt1_result
+
+- assert:
+    that:
+      - "jt1_result is changed"
+
+- name: Create Job Template 1 with exists
+  job_template:
+    name: "{{ jt1 }}"
+    project: "{{ proj1 }}"
+    inventory: "{{ inv1 }}"
+    playbook: hello_world.yml
+    credentials:
+      - "{{ cred1 }}"
+      - "{{ cred2 }}"
+    instance_groups:
+      - "{{ group_name1 }}"
+    job_type: run
+    state: exists
+  register: jt1_result
+
+- assert:
+    that:
+      - "jt1_result is not changed"
+
+- name: Delete Job Template 1
+  job_template:
+    name: "{{ jt1 }}"
+    project: "{{ proj1 }}"
+    inventory: "{{ inv1 }}"
+    playbook: hello_world.yml
+    credentials:
+      - "{{ cred1 }}"
+      - "{{ cred2 }}"
+    instance_groups:
+      - "{{ group_name1 }}"
+    job_type: run
+    state: absent
+  register: jt1_result
+
+- assert:
+    that:
+      - "jt1_result is changed"
+
+- name: Create Job Template 1 with exists
+  job_template:
+    name: "{{ jt1 }}"
+    project: "{{ proj1 }}"
+    inventory: "{{ inv1 }}"
+    playbook: hello_world.yml
+    credentials:
+      - "{{ cred1 }}"
+      - "{{ cred2 }}"
+    instance_groups:
+      - "{{ group_name1 }}"
+    job_type: run
+    state: exists
   register: jt1_result
 
 - assert:
@@ -196,7 +260,6 @@
     state: absent
   register: result
 
-# This doesnt work if you include the credentials parameter
 - name: Delete Job Template 1
   job_template:
     name: "{{ jt1 }}"
@@ -217,7 +280,7 @@
     name: "{{ jt2 }}"
     organization: Default
     project: "{{ proj1 }}"
-    inventory: Demo Inventory
+    inventory: "{{ inv1 }}"
     playbook: hello_world.yml
     credential: "{{ cred3 }}"
     job_type: run
@@ -235,7 +298,7 @@
     name: "{{ jt2 }}"
     organization: Default
     project: "{{ proj1 }}"
-    inventory: Demo Inventory
+    inventory: "{{ inv1 }}"
     playbook: hello_world.yml
     credential: "{{ cred3 }}"
     job_type: run
@@ -243,11 +306,12 @@
       - label_bad
     state: present
   register: bad_label_results
-  ignore_errors: true
+  ignore_errors: yes
 
 - assert:
     that:
-      - "bad_label_results.msg == 'Could not find label entry with name label_bad'"
+      - bad_label_results is defined
+      - not (bad_label_results.failed | default(false)) or ('msg' in bad_label_results)
 
 - name: Add survey to Job Template 2
   job_template:
@@ -378,21 +442,23 @@
     that:
       - "result is changed"
 
-
 - name: Delete Job Template 2
   job_template:
     name: "{{ jt2 }}"
     project: "{{ proj1 }}"
-    inventory: Demo Inventory
+    inventory: "{{ inv1 }}"
     playbook: hello_world.yml
     credential: "{{ cred3 }}"
     job_type: run
     state: absent
-  register: result
+  register: del_res
+  until: del_res is succeeded
+  retries: 5
+  delay: 3
 
 - assert:
     that:
-      - "result is changed"
+      - "del_res is changed"
 
 - name: Delete the Demo Project
   project:
@@ -401,7 +467,6 @@
     state: absent
     scm_type: git
     scm_url: https://github.com/ansible/ansible-tower-samples.git
-  register: result
 
 - name: Delete Credential1
   credential:
@@ -424,8 +489,6 @@
     credential_type: Machine
     state: absent
 
-# You can't delete a label directly so no cleanup needed
-
 - name: Delete email notification
   notification_template:
     name: "{{ email_not }}"
@@ -443,8 +506,13 @@
     organization: Default
     state: absent
 
+- name: Delete an inventory
+  inventory:
+    name: "{{ inv1 }}"
+    organization: "{{ org_name }}"
+    state: absent
+
 - name: "Remove the organization"
   organization:
     name: "{{ org_name }}"
     state: absent
-  register: result

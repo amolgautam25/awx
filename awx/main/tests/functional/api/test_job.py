@@ -13,17 +13,11 @@ from django.utils import timezone
 # AWX
 from awx.api.versioning import reverse
 from awx.api.views import RelatedJobsPreventDeleteMixin, UnifiedJobDeletionMixin
-from awx.main.models import (
-    JobTemplate,
-    User,
-    Job,
-    AdHocCommand,
-    ProjectUpdate,
-)
+from awx.main.models import JobTemplate, User, Job, AdHocCommand, ProjectUpdate, InstanceGroup, Label, Organization
 
 
 @pytest.mark.django_db
-def test_job_relaunch_permission_denied_response(post, get, inventory, project, credential, net_credential, machine_credential):
+def test_job_relaunch_permission_denied_response(post, get, inventory, project, net_credential, machine_credential):
     jt = JobTemplate.objects.create(name='testjt', inventory=inventory, project=project, ask_credential_on_launch=True)
     jt.credentials.add(machine_credential)
     jt_user = User.objects.create(username='jobtemplateuser')
@@ -39,6 +33,32 @@ def test_job_relaunch_permission_denied_response(post, get, inventory, project, 
     job.launch_config.credentials.add(net_credential)
     r = post(reverse('api:job_relaunch', kwargs={'pk': job.pk}), {}, jt_user, expect=403)
     assert 'launched with prompted fields you do not have access to' in r.data['detail']
+    job.launch_config.credentials.clear()
+
+    # Job has prompted instance group that user cannot see
+    job.launch_config.instance_groups.add(InstanceGroup.objects.create())
+    r = post(reverse('api:job_relaunch', kwargs={'pk': job.pk}), {}, jt_user, expect=403)
+    assert 'launched with prompted fields you do not have access to' in r.data['detail']
+    job.launch_config.instance_groups.clear()
+
+    # Job has prompted label that user cannot see
+    job.launch_config.labels.add(Label.objects.create(organization=Organization.objects.create()))
+    r = post(reverse('api:job_relaunch', kwargs={'pk': job.pk}), {}, jt_user, expect=403)
+    assert 'launched with prompted fields you do not have access to' in r.data['detail']
+    job.launch_config.labels.clear()
+
+    # without any of those prompts, user can launch
+    r = post(reverse('api:job_relaunch', kwargs={'pk': job.pk}), {}, jt_user, expect=201)
+
+
+@pytest.mark.django_db
+def test_label_sublist(get, admin_user, organization):
+    job = Job.objects.create()
+    label = Label.objects.create(organization=organization, name='Steve')
+    job.labels.add(label)
+    r = get(url=reverse('api:job_label_list', kwargs={'pk': job.pk}), user=admin_user, expect=200)
+    assert r.data['count'] == 1
+    assert r.data['results'].pop()['id'] == label.id
 
 
 @pytest.mark.django_db
@@ -190,6 +210,39 @@ def test_disallowed_http_update_methods(put, patch, post, inventory, project, ad
     patch(url=reverse('api:job_detail', kwargs={'pk': job.pk}), data={}, user=admin_user, expect=405)
 
 
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "job_type",
+    [
+        'run',
+        'check',
+    ],
+)
+def test_job_relaunch_with_job_type(post, inventory, project, machine_credential, admin_user, job_type):
+    # Create a job template
+    jt = JobTemplate.objects.create(name='testjt', inventory=inventory, project=project)
+
+    # Set initial job type
+    init_job_type = 'check' if job_type == 'run' else 'run'
+
+    # Create a job instance
+    job = jt.create_unified_job(_eager_fields={'job_type': init_job_type})
+
+    # Perform the POST request
+    url = reverse('api:job_relaunch', kwargs={'pk': job.pk})
+    r = post(url=url, data={'job_type': job_type}, user=admin_user, expect=201)
+
+    # Assert that the response status code is 201 (Created)
+    assert r.status_code == 201
+
+    # Retrieve the newly created job from the response
+    new_job_id = r.data.get('id')
+    new_job = Job.objects.get(id=new_job_id)
+
+    # Assert that the new job has the correct job type
+    assert new_job.job_type == job_type
+
+
 class TestControllerNode:
     @pytest.fixture
     def project_update(self, project):
@@ -204,7 +257,7 @@ class TestControllerNode:
         return AdHocCommand.objects.create(inventory=inventory)
 
     @pytest.mark.django_db
-    def test_field_controller_node_exists(self, sqlite_copy_expert, admin_user, job, project_update, inventory_update, adhoc, get, system_job_factory):
+    def test_field_controller_node_exists(self, sqlite_copy, admin_user, job, project_update, inventory_update, adhoc, get, system_job_factory):
         system_job = system_job_factory()
 
         r = get(reverse('api:unified_job_list') + '?id={}'.format(job.id), admin_user, expect=200)
@@ -220,7 +273,7 @@ class TestControllerNode:
         assert 'controller_node' not in r.data
 
         r = get(reverse('api:inventory_update_detail', kwargs={'pk': inventory_update.pk}), admin_user, expect=200)
-        assert 'controller_node' not in r.data
+        assert 'controller_node' in r.data
 
         r = get(reverse('api:system_job_detail', kwargs={'pk': system_job.pk}), admin_user, expect=200)
         assert 'controller_node' not in r.data

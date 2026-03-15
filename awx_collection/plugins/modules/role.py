@@ -17,18 +17,34 @@ DOCUMENTATION = '''
 module: role
 author: "Wayne Witzel III (@wwitzel3)"
 short_description: grant or revoke an Automation Platform Controller role.
+deprecated:
+    removed_in: '25.0.0'
+    why: Endpoints corresponding to module will be removed in the API
+    alternative: Use the role_user_assignment and role_team_assignment modules instead.
 description:
     - Roles are used for access control, this module is for managing user access to server resources.
     - Grant or revoke Automation Platform Controller roles to users. See U(https://www.ansible.com/tower) for an overview.
 options:
     user:
       description:
-        - User that receives the permissions specified by the role.
+        - User name, ID, or named URL that receives the permissions specified by the role.
+        - Deprecated, use 'users'.
       type: str
+    users:
+      description:
+        - User names, IDs, or named URLs that receive the permissions specified by the role.
+      type: list
+      elements: str
     team:
       description:
-        - Team that receives the permissions specified by the role.
+        - Team name, ID, or named URL that receives the permissions specified by the role.
+        - Deprecated, use 'teams'.
       type: str
+    teams:
+      description:
+        - Team names, IDs, or named URLs that receive the permissions specified by the role.
+      type: list
+      elements: str
     role:
       description:
         - The role type to grant/revoke.
@@ -38,82 +54,87 @@ options:
       type: str
     target_team:
       description:
-        - Team that the role acts on.
+        - Team name, ID, or named URL that the role acts on.
         - For example, make someone a member or an admin of a team.
         - Members of a team implicitly receive the permissions that the team has.
         - Deprecated, use 'target_teams'.
       type: str
     target_teams:
       description:
-        - Team that the role acts on.
+        - Team names, IDs, or named URLs that the role acts on.
         - For example, make someone a member or an admin of a team.
         - Members of a team implicitly receive the permissions that the team has.
       type: list
       elements: str
     inventory:
       description:
-        - Inventory the role acts on.
+        - Inventory name, ID, or named URL the role acts on.
         - Deprecated, use 'inventories'.
       type: str
     inventories:
       description:
-        - Inventory the role acts on.
+        - Inventory names, IDs, or named URLs the role acts on.
       type: list
       elements: str
     job_template:
       description:
-        - The job template the role acts on.
+        - The job template name, ID, or named URL the role acts on.
         - Deprecated, use 'job_templates'.
       type: str
     job_templates:
       description:
-        - The job template the role acts on.
+        - The job template names, IDs, or named URLs the role acts on.
       type: list
       elements: str
     workflow:
       description:
-        - The workflow job template the role acts on.
+        - The workflow job template name, ID, or named URL the role acts on.
         - Deprecated, use 'workflows'.
       type: str
     workflows:
       description:
-        - The workflow job template the role acts on.
+        - The workflow job template names, IDs, or named URLs the role acts on.
       type: list
       elements: str
     credential:
       description:
-        - Credential the role acts on.
+        - Credential name, ID, or named URL the role acts on.
         - Deprecated, use 'credentials'.
       type: str
     credentials:
       description:
-        - Credential the role acts on.
+        - Credential names, IDs, or named URLs the role acts on.
       type: list
       elements: str
     organization:
       description:
-        - Organization the role acts on.
+        - Organization name, ID, or named URL the role acts on.
         - Deprecated, use 'organizations'.
       type: str
     organizations:
       description:
-        - Organization the role acts on.
+        - Organization names, IDs, or named URLs the role acts on.
       type: list
       elements: str
     lookup_organization:
       description:
-        - Organization the inventories, job templates, projects, or workflows the items exists in.
+        - Organization name, ID, or named URL the inventories, job templates, projects, or workflows the items exists in.
         - Used to help lookup the object, for organization roles see organization.
         - If not provided, will lookup by name only, which does not work with duplicates.
       type: str
     project:
       description:
-        - Project the role acts on.
+        - Project name, ID, or named URL the role acts on.
         - Deprecated, use 'projects'.
       type: str
     projects:
       description:
-        - Project the role acts on.
+        - Project names, IDs, or named URLs the role acts on.
+      type: list
+      elements: str
+    instance_groups:
+      description:
+        - Instance Group names, IDs, or named URLs the role acts on.
       type: list
       elements: str
     state:
@@ -141,7 +162,8 @@ EXAMPLES = '''
   role:
     user: joe
     role: execute
-    workflow: test-role-workflow
+    workflows:
+      - test-role-workflow
     job_templates:
       - jt1
       - jt2
@@ -155,7 +177,9 @@ def main():
 
     argument_spec = dict(
         user=dict(),
+        users=dict(type='list', elements='str'),
         team=dict(),
+        teams=dict(type='list', elements='str'),
         role=dict(
             choices=[
                 "admin",
@@ -192,6 +216,7 @@ def main():
         lookup_organization=dict(),
         project=dict(),
         projects=dict(type='list', elements='str'),
+        instance_groups=dict(type='list', elements='str'),
         state=dict(choices=['present', 'absent'], default='present'),
     )
 
@@ -212,9 +237,10 @@ def main():
         'projects': 'project',
         'target_teams': 'target_team',
         'workflows': 'workflow',
+        'users': 'user',
+        'teams': 'team',
+        'instance_groups': 'instance_group',
     }
-    # Singular parameters
-    resource_param_keys = ('user', 'team', 'lookup_organization')
 
     resources = {}
     for resource_group, old_name in resource_list_param_keys.items():
@@ -222,14 +248,13 @@ def main():
             resources.setdefault(resource_group, []).extend(module.params.get(resource_group))
         if module.params.get(old_name) is not None:
             resources.setdefault(resource_group, []).append(module.params.get(old_name))
-    for resource_group in resource_param_keys:
-        if module.params.get(resource_group) is not None:
-            resources[resource_group] = module.params.get(resource_group)
-    # Change workflows and target_teams key to its endpoint name.
+    if module.params.get('lookup_organization') is not None:
+        resources['lookup_organization'] = module.params.get('lookup_organization')
+    if module.params.get('instance_groups') is not None:
+        resources['instance_groups'] = module.params.get('instance_groups')
+    # Change workflows to its endpoint name.
     if 'workflows' in resources:
         resources['workflow_job_templates'] = resources.pop('workflows')
-    if 'target_teams' in resources:
-        resources['teams'] = resources.pop('target_teams')
 
     # Set lookup data to use
     lookup_data = {}
@@ -240,32 +265,37 @@ def main():
     # Lookup actor data
     # separate actors from resources
     actor_data = {}
-    for key in ('user', 'team'):
-        if key in resources:
-            if key == 'user':
-                lookup_data_populated = {}
-            else:
-                lookup_data_populated = lookup_data
-            # Attempt to look up project based on the provided name or ID and lookup data
-            actor_data[key] = module.get_one('{0}s'.format(key), name_or_id=resources[key], data=lookup_data_populated)
-            resources.pop(key)
-
+    missing_items = []
     # Lookup Resources
     resource_data = {}
     for key, value in resources.items():
         for resource in value:
-            # Attempt to look up project based on the provided name or ID and lookup data
-            if key in resources:
-                if key == 'organizations':
-                    lookup_data_populated = {}
+            # Attempt to look up project based on the provided name, ID, or named URL and lookup data
+            lookup_key = key
+            if key == 'organizations' or key == 'users' or key == 'teams':
+                lookup_data_populated = {}
+            else:
+                lookup_data_populated = lookup_data
+            if key == 'target_teams':
+                lookup_key = 'teams'
+            data = module.get_one(lookup_key, name_or_id=resource, data=lookup_data_populated)
+            if data is None:
+                missing_items.append(resource)
+            else:
+                if key == 'users' or key == 'teams':
+                    actor_data.setdefault(key, []).append(data)
+                elif key == 'target_teams':
+                    resource_data.setdefault('teams', []).append(data)
                 else:
-                    lookup_data_populated = lookup_data
-
-            resource_data.setdefault(key, []).append(module.get_one(key, name_or_id=resource, data=lookup_data_populated))
+                    resource_data.setdefault(key, []).append(data)
+    if len(missing_items) > 0:
+        module.fail_json(
+            msg='There were {0} missing items, missing items: {1}'.format(len(missing_items), missing_items), changed=False
+        )
 
     # build association agenda
     associations = {}
-    for actor_type, actor in actor_data.items():
+    for actor_type, actors in actor_data.items():
         for key, value in resource_data.items():
             for resource in value:
                 resource_roles = resource['summary_fields']['object_roles']
@@ -275,9 +305,10 @@ def main():
                         msg='Resource {0} has no role {1}, available roles: {2}'.format(resource['url'], role_field, available_roles), changed=False
                     )
                 role_data = resource_roles[role_field]
-                endpoint = '/roles/{0}/{1}/'.format(role_data['id'], module.param_to_endpoint(actor_type))
+                endpoint = '/roles/{0}/{1}/'.format(role_data['id'], actor_type)
                 associations.setdefault(endpoint, [])
-                associations[endpoint].append(actor['id'])
+                for actor in actors:
+                    associations[endpoint].append(actor['id'])
 
     # perform associations
     for association_endpoint, new_association_list in associations.items():

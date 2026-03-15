@@ -28,52 +28,69 @@ options:
       default: 'False'
     organizations:
       description:
-        - organization name to export
-      type: str
+        - organization names, IDs, or named URLs to export
+      type: list
+      elements: str
     users:
       description:
-        - user name to export
-      type: str
+        - user names, IDs, or named URLs to export
+      type: list
+      elements: str
     teams:
       description:
-        - team name to export
-      type: str
+        - team names, IDs, or named URLs to export
+      type: list
+      elements: str
     credential_types:
       description:
-        - credential type name to export
-      type: str
+        - credential type names, IDs, or named URLs to export
+      type: list
+      elements: str
     credentials:
       description:
-        - credential name to export
-      type: str
+        - credential names, IDs, or named URLs to export
+      type: list
+      elements: str
     execution_environments:
       description:
-        - execution environment name to export
-      type: str
+        - execution environment names, IDs, or named URLs to export
+      type: list
+      elements: str
     notification_templates:
       description:
-        - notification template name to export
-      type: str
+        - notification template names, IDs, or named URLs to export
+      type: list
+      elements: str
     inventory_sources:
       description:
-        - inventory soruce to export
-      type: str
+        - inventory source name, ID, or named URLs to export
+      type: list
+      elements: str
     inventory:
       description:
-        - inventory name to export
-      type: str
+        - inventory names, IDs, or named URLs to export
+      type: list
+      elements: str
     projects:
       description:
-        - project name to export
-      type: str
+        - project names, IDs, or named URLs to export
+      type: list
+      elements: str
     job_templates:
       description:
-        - job template name to export
-      type: str
+        - job template names, IDs, or named URLs to export
+      type: list
+      elements: str
     workflow_job_templates:
       description:
-        - workflow name to export
-      type: str
+        - workflow names, IDs, or named URLs to export
+      type: list
+      elements: str
+    schedules:
+      description:
+        - schedule names, IDs, or named URLs to export
+      type: list
+      elements: str
 requirements:
   - "awxkit >= 9.3.0"
 notes:
@@ -84,7 +101,7 @@ extends_documentation_fragment: awx.awx.auth
 EXAMPLES = '''
 - name: Export all assets
   export:
-    all: True
+    all: true
 
 - name: Export all inventories
   export:
@@ -92,8 +109,12 @@ EXAMPLES = '''
 
 - name: Export a job template named "My Template" and all Credentials
   export:
-    job_template: "My Template"
-    credential: 'all'
+    job_templates: "My Template"
+    credentials: 'all'
+
+- name: Export a list of inventories
+  export:
+    inventory: ['My Inventory 1', 'My Inventory 2']
 '''
 
 import logging
@@ -111,24 +132,12 @@ except ImportError:
 def main():
     argument_spec = dict(
         all=dict(type='bool', default=False),
-        credential_types=dict(type='str'),
-        credentials=dict(type='str'),
-        execution_environments=dict(type='str'),
-        inventory=dict(type='str'),
-        inventory_sources=dict(type='str'),
-        job_templates=dict(type='str'),
-        notification_templates=dict(type='str'),
-        organizations=dict(type='str'),
-        projects=dict(type='str'),
-        teams=dict(type='str'),
-        users=dict(type='str'),
-        workflow_job_templates=dict(type='str'),
     )
 
     # We are not going to raise an error here because the __init__ method of ControllerAWXKitModule will do that for us
     if HAS_EXPORTABLE_RESOURCES:
         for resource in EXPORTABLE_RESOURCES:
-            argument_spec[resource] = dict(type='str')
+            argument_spec[resource] = dict(type='list', elements='str')
 
     module = ControllerAWXKitModule(argument_spec=argument_spec)
 
@@ -140,12 +149,12 @@ def main():
 
     # The exporter code currently works like the following:
     #   Empty string == all assets of that type
-    #   Non-Empty string = just one asset of that type (by name or ID)
+    #   Non-Empty string = just a list of assets of that type (by name, ID, or named URL)
     #   Asset type not present or None = skip asset type (unless everything is None, then export all)
     # Here we are going to setup a dict of values to export
     export_args = {}
     for resource in EXPORTABLE_RESOURCES:
-        if module.params.get('all') or module.params.get(resource) == 'all':
+        if module.params.get('all') or module.params.get(resource) == ['all']:
             # If we are exporting everything or we got the keyword "all" we pass in an empty string for this asset type
             export_args[resource] = ''
         else:

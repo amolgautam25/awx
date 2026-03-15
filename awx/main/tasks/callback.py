@@ -1,28 +1,86 @@
 import json
+import os.path
 import time
 import logging
 from collections import deque
-import os
-import stat
+from typing import Tuple, Optional
+
+from awx.main.models.event_query import EventQuery
 
 # Django
-from django.utils.timezone import now
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django_guid import get_guid
+from django.utils.functional import cached_property
+from django.db import connections
 
 # AWX
 from awx.main.redact import UriCleaner
-from awx.main.constants import MINIMAL_EVENTS
+from awx.main.constants import MINIMAL_EVENTS, ANSIBLE_RUNNER_NEEDS_UPDATE_MESSAGE
 from awx.main.utils.update_model import update_model
 from awx.main.queue import CallbackQueueDispatcher
+
+from flags.state import flag_enabled
 
 logger = logging.getLogger('awx.main.tasks.callback')
 
 
-class RunnerCallback:
-    event_data_key = 'job_id'
+def collect_queries(query_file_contents) -> dict:
+    """
+    collect_queries extracts host queries from the contents of
+    ansible_data.json
+    """
+    result = {}
 
+    try:
+        installed_collections = query_file_contents['installed_collections']
+    except KeyError:
+        logger.error("installed_collections missing in callback response")
+        return result
+
+    for key, value in installed_collections.items():
+        if 'host_query' in value and 'version' in value:
+            result[key] = value
+
+    return result
+
+
+COLLECTION_FILENAME = "ansible_data.json"
+
+
+def try_load_query_file(artifact_dir) -> Tuple[bool, Optional[dict]]:
+    """
+    try_load_query_file checks the artifact directory after job completion and
+    returns the contents of ansible_data.json if present
+    """
+
+    if not flag_enabled("FEATURE_INDIRECT_NODE_COUNTING_ENABLED"):
+        return False, None
+
+    queries_path = os.path.join(artifact_dir, COLLECTION_FILENAME)
+    if not os.path.isfile(queries_path):
+        logger.info(f"no query file found: {queries_path}")
+        return False, None
+
+    try:
+        f = open(queries_path, "r")
+    except OSError as e:
+        logger.error(f"error opening query file {queries_path}: {e}")
+        return False, None
+
+    with f:
+        try:
+            queries = json.load(f)
+        except ValueError as e:
+            logger.error(f"error parsing query file {queries_path}: {e}")
+            return False, None
+
+        return True, queries
+
+
+class RunnerCallback:
     def __init__(self, model=None):
+        self.instance = None
         self.parent_workflow_job_id = None
         self.host_map = {}
         self.guid = get_guid()
@@ -32,10 +90,41 @@ class RunnerCallback:
         self.safe_env = {}
         self.event_ct = 0
         self.model = model
-        self.update_attempts = int(settings.DISPATCHER_DB_DOWNTOWN_TOLLERANCE / 5)
+        self.update_attempts = int(getattr(settings, 'DISPATCHER_DB_DOWNTOWN_TOLLERANCE', settings.DISPATCHER_DB_DOWNTIME_TOLERANCE) / 5)
+        self.wrapup_event_dispatched = False
+        self.artifacts_processed = False
+        self.extra_update_fields = {}
 
     def update_model(self, pk, _attempt=0, **updates):
         return update_model(self.model, pk, _attempt=0, _max_attempts=self.update_attempts, **updates)
+
+    @cached_property
+    def wrapup_event_type(self):
+        return self.instance.event_class.WRAPUP_EVENT
+
+    @cached_property
+    def event_data_key(self):
+        return self.instance.event_class.JOB_REFERENCE
+
+    def delay_update(self, skip_if_already_set=False, **kwargs):
+        """Stash fields that should be saved along with the job status change"""
+        for key, value in kwargs.items():
+            if key in self.extra_update_fields and skip_if_already_set:
+                continue
+            elif key in self.extra_update_fields and key in ('job_explanation', 'result_traceback'):
+                if str(value) in self.extra_update_fields.get(key, ''):
+                    continue  # if already set, avoid duplicating messages
+                # In the case of these fields, we do not want to lose any prior information, so combine values
+                self.extra_update_fields[key] = '\n'.join([str(self.extra_update_fields[key]), str(value)])
+            else:
+                self.extra_update_fields[key] = value
+
+    def get_delayed_update_fields(self):
+        """Return finalized dict of all fields that should be saved along with the job status change"""
+        self.extra_update_fields['emitted_events'] = self.event_ct
+        if 'got an unexpected keyword argument' in self.extra_update_fields.get('result_traceback', ''):
+            self.delay_update(result_traceback=ANSIBLE_RUNNER_NEEDS_UPDATE_MESSAGE)
+        return self.extra_update_fields
 
     def event_handler(self, event_data):
         #
@@ -58,6 +147,8 @@ class RunnerCallback:
         # which generate job events from two 'streams':
         # ansible-inventory and the awx.main.commands.inventory_import
         # logger
+        if event_data.get('event') == 'keepalive':
+            return
 
         if event_data.get(self.event_data_key, None):
             if self.event_data_key != 'job_id':
@@ -65,17 +156,17 @@ class RunnerCallback:
         if self.parent_workflow_job_id:
             event_data['workflow_job_id'] = self.parent_workflow_job_id
         event_data['job_created'] = self.job_created
-        if self.host_map:
-            host = event_data.get('event_data', {}).get('host', '').strip()
-            if host:
-                event_data['host_name'] = host
-                if host in self.host_map:
-                    event_data['host_id'] = self.host_map[host]
-            else:
-                event_data['host_name'] = ''
-                event_data['host_id'] = ''
-            if event_data.get('event') == 'playbook_on_stats':
-                event_data['host_map'] = self.host_map
+
+        host = event_data.get('event_data', {}).get('host', '').strip()
+        if host:
+            event_data['host_name'] = host
+            if host in self.host_map:
+                event_data['host_id'] = self.host_map[host]
+        else:
+            event_data['host_name'] = ''
+            event_data['host_id'] = ''
+        if event_data.get('event') == 'playbook_on_stats':
+            event_data['host_map'] = self.host_map
 
         if isinstance(self, RunnerCallbackForProjectUpdate):
             # need a better way to have this check.
@@ -89,7 +180,7 @@ class RunnerCallback:
             # so it *should* have a negligible performance impact
             task = event_data.get('event_data', {}).get('task_action')
             try:
-                if task in ('git', 'svn'):
+                if task in ('git', 'svn', 'ansible.builtin.git', 'ansible.builtin.svn'):
                     event_data_json = json.dumps(event_data)
                     event_data_json = UriCleaner.remove_sensitive(event_data_json)
                     event_data = json.loads(event_data_json)
@@ -130,6 +221,9 @@ class RunnerCallback:
         elif self.recent_event_timings.maxlen:
             self.recent_event_timings.append(time.time())
 
+        if event_data.get('event', '') == self.wrapup_event_type:
+            self.wrapup_event_dispatched = True
+
         event_data.setdefault(self.event_data_key, self.instance.id)
         self.dispatcher.dispatch(event_data)
         self.event_ct += 1
@@ -138,25 +232,8 @@ class RunnerCallback:
         Handle artifacts
         '''
         if event_data.get('event_data', {}).get('artifact_data', {}):
-            self.instance.artifacts = event_data['event_data']['artifact_data']
-            self.instance.save(update_fields=['artifacts'])
+            self.delay_update(artifacts=event_data['event_data']['artifact_data'])
 
-        return False
-
-    def cancel_callback(self):
-        """
-        Ansible runner callback to tell the job when/if it is canceled
-        """
-        unified_job_id = self.instance.pk
-        self.instance = self.update_model(unified_job_id)
-        if not self.instance:
-            logger.error('unified job {} was deleted while running, canceling'.format(unified_job_id))
-            return True
-        if self.instance.cancel_flag or self.instance.status == 'canceled':
-            cancel_wait = (now() - self.instance.modified).seconds if self.instance.modified else 0
-            if cancel_wait > 5:
-                logger.warning('Request to cancel {} took {} seconds to complete.'.format(self.instance.log_format, cancel_wait))
-            return True
         return False
 
     def finished_callback(self, runner_obj):
@@ -170,6 +247,8 @@ class RunnerCallback:
         }
         event_data.setdefault(self.event_data_key, self.instance.id)
         self.dispatcher.dispatch(event_data)
+        if self.wrapup_event_type == 'EOF':
+            self.wrapup_event_dispatched = True
 
     def status_handler(self, status_data, runner_config):
         """
@@ -187,34 +266,45 @@ class RunnerCallback:
 
             with disable_activity_stream():
                 self.instance = self.update_model(self.instance.pk, job_args=json.dumps(runner_config.command), job_cwd=runner_config.cwd, job_env=job_env)
-        elif status_data['status'] == 'failed':
-            # For encrypted ssh_key_data, ansible-runner worker will open and write the
-            # ssh_key_data to a named pipe. Then, once the podman container starts, ssh-agent will
-            # read from this named pipe so that the key can be used in ansible-playbook.
-            # Once the podman container exits, the named pipe is deleted.
-            # However, if the podman container fails to start in the first place, e.g. the image
-            # name is incorrect, then this pipe is not cleaned up. Eventually ansible-runner
-            # processor will attempt to write artifacts to the private data dir via unstream_dir, requiring
-            # that it open this named pipe. This leads to a hang. Thus, before any artifacts
-            # are written by the processor, it's important to remove this ssh_key_data pipe.
-            private_data_dir = self.instance.job_env.get('AWX_PRIVATE_DATA_DIR', None)
-            if private_data_dir:
-                key_data_file = os.path.join(private_data_dir, 'artifacts', str(self.instance.id), 'ssh_key_data')
-                if os.path.exists(key_data_file) and stat.S_ISFIFO(os.stat(key_data_file).st_mode):
-                    os.remove(key_data_file)
+            # We opened a connection just for that save, close it here now
+            connections.close_all()
         elif status_data['status'] == 'error':
-            result_traceback = status_data.get('result_traceback', None)
-            if result_traceback:
-                from awx.main.signals import disable_activity_stream  # Circular import
+            for field_name in ('result_traceback', 'job_explanation'):
+                field_value = status_data.get(field_name, None)
+                if field_value:
+                    self.delay_update(**{field_name: field_value})
 
-                with disable_activity_stream():
-                    self.instance = self.update_model(self.instance.pk, result_traceback=result_traceback)
+    def artifacts_handler(self, artifact_dir):
+        success, query_file_contents = try_load_query_file(artifact_dir)
+        if success:
+            self.delay_update(event_queries_processed=False)
+            collections_info = collect_queries(query_file_contents)
+            for collection, data in collections_info.items():
+                version = data['version']
+                event_query = data['host_query']
+                instance = EventQuery(fqcn=collection, collection_version=version, event_query=event_query)
+                try:
+                    instance.validate_unique()
+                    instance.save()
+
+                    logger.info(f"eventy query for collection {collection}, version {version} created")
+                except ValidationError as e:
+                    logger.info(e)
+
+            if 'installed_collections' in query_file_contents:
+                self.delay_update(installed_collections=query_file_contents['installed_collections'])
+            else:
+                logger.warning(f'The file {COLLECTION_FILENAME} unexpectedly did not contain installed_collections')
+
+            if 'ansible_version' in query_file_contents:
+                self.delay_update(ansible_version=query_file_contents['ansible_version'])
+            else:
+                logger.warning(f'The file {COLLECTION_FILENAME} unexpectedly did not contain ansible_version')
+
+        self.artifacts_processed = True
 
 
 class RunnerCallbackForProjectUpdate(RunnerCallback):
-
-    event_data_key = 'project_update_id'
-
     def __init__(self, *args, **kwargs):
         super(RunnerCallbackForProjectUpdate, self).__init__(*args, **kwargs)
         self.playbook_new_revision = None
@@ -223,7 +313,7 @@ class RunnerCallbackForProjectUpdate(RunnerCallback):
     def event_handler(self, event_data):
         super_return_value = super(RunnerCallbackForProjectUpdate, self).event_handler(event_data)
         returned_data = event_data.get('event_data', {})
-        if returned_data.get('task_action', '') == 'set_fact':
+        if returned_data.get('task_action', '') in ('set_fact', 'ansible.builtin.set_fact'):
             returned_facts = returned_data.get('res', {}).get('ansible_facts', {})
             if 'scm_version' in returned_facts:
                 self.playbook_new_revision = returned_facts['scm_version']
@@ -231,9 +321,6 @@ class RunnerCallbackForProjectUpdate(RunnerCallback):
 
 
 class RunnerCallbackForInventoryUpdate(RunnerCallback):
-
-    event_data_key = 'inventory_update_id'
-
     def __init__(self, *args, **kwargs):
         super(RunnerCallbackForInventoryUpdate, self).__init__(*args, **kwargs)
         self.end_line = 0
@@ -245,14 +332,10 @@ class RunnerCallbackForInventoryUpdate(RunnerCallback):
 
 
 class RunnerCallbackForAdHocCommand(RunnerCallback):
-
-    event_data_key = 'ad_hoc_command_id'
-
     def __init__(self, *args, **kwargs):
         super(RunnerCallbackForAdHocCommand, self).__init__(*args, **kwargs)
         self.host_map = {}
 
 
 class RunnerCallbackForSystemJob(RunnerCallback):
-
-    event_data_key = 'system_job_id'
+    pass

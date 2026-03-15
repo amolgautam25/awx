@@ -2,7 +2,8 @@
 # All Rights Reserved.
 import sys
 
-from awx.main.utils.pglock import advisory_lock
+from ansible_base.lib.utils.db import advisory_lock
+
 from awx.main.models import Instance, InstanceGroup
 
 from django.core.management.base import BaseCommand, CommandError
@@ -17,7 +18,9 @@ class InstanceNotFound(Exception):
 
 
 class RegisterQueue:
-    def __init__(self, queuename, instance_percent, inst_min, hostname_list, is_container_group=None, pod_spec_override=None):
+    def __init__(
+        self, queuename, instance_percent, inst_min, hostname_list, is_container_group=None, pod_spec_override=None, max_forks=None, max_concurrent_jobs=None
+    ):
         self.instance_not_found_err = None
         self.queuename = queuename
         self.instance_percent = instance_percent
@@ -25,11 +28,13 @@ class RegisterQueue:
         self.hostname_list = hostname_list
         self.is_container_group = is_container_group
         self.pod_spec_override = pod_spec_override
+        self.max_forks = max_forks
+        self.max_concurrent_jobs = max_concurrent_jobs
 
     def get_create_update_instance_group(self):
         created = False
         changed = False
-        (ig, created) = InstanceGroup.objects.get_or_create(name=self.queuename)
+        ig, created = InstanceGroup.objects.get_or_create(name=self.queuename)
         if ig.policy_instance_percentage != self.instance_percent:
             ig.policy_instance_percentage = self.instance_percent
             changed = True
@@ -43,6 +48,14 @@ class RegisterQueue:
 
         if self.pod_spec_override and (ig.pod_spec_override != self.pod_spec_override):
             ig.pod_spec_override = self.pod_spec_override
+            changed = True
+
+        if self.max_forks and (ig.max_forks != self.max_forks):
+            ig.max_forks = self.max_forks
+            changed = True
+
+        if self.max_concurrent_jobs and (ig.max_concurrent_jobs != self.max_concurrent_jobs):
+            ig.max_concurrent_jobs = self.max_concurrent_jobs
             changed = True
 
         if changed:
@@ -78,14 +91,14 @@ class RegisterQueue:
         with advisory_lock('cluster_policy_lock'):
             with transaction.atomic():
                 changed2 = False
-                (ig, created, changed1) = self.get_create_update_instance_group()
+                ig, created, changed1 = self.get_create_update_instance_group()
                 if created:
                     print("Creating instance group {}".format(ig.name))
                 elif not created:
                     print("Instance Group already registered {}".format(ig.name))
 
                 try:
-                    (instances, changed2) = self.add_instances_to_group(ig)
+                    instances, changed2 = self.add_instances_to_group(ig)
                     for i in instances:
                         print("Added instance {} to {}".format(i.hostname, ig.name))
                 except InstanceNotFound as e:

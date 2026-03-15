@@ -4,7 +4,6 @@ from django.db import migrations, models
 import uuid
 import logging
 
-
 logger = logging.getLogger('awx.main.migrations')
 
 
@@ -20,7 +19,6 @@ def create_uuid(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('main', '0111_v370_delete_channelgroup'),
     ]

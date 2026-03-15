@@ -4,9 +4,10 @@ from awx.main.models import (
     Instance,
     InstanceGroup,
 )
+from awx.main.scheduler.task_manager_models import TaskManagerInstanceGroups
 
 
-class TestCapacityMapping(TransactionTestCase):
+class TestInstanceGroupInstanceMapping(TransactionTestCase):
     def sample_cluster(self):
         ig_small = InstanceGroup.objects.create(name='ig_small')
         ig_large = InstanceGroup.objects.create(name='ig_large')
@@ -21,10 +22,11 @@ class TestCapacityMapping(TransactionTestCase):
 
     def test_mapping(self):
         self.sample_cluster()
-        with self.assertNumQueries(2):
-            inst_map, ig_map = InstanceGroup.objects.capacity_mapping()
-        assert inst_map['i1'] == set(['ig_small'])
-        assert inst_map['i2'] == set(['ig_large', 'default'])
-        assert ig_map['ig_small'] == set(['ig_small'])
-        assert ig_map['ig_large'] == set(['ig_large', 'default'])
-        assert ig_map['default'] == set(['ig_large', 'default'])
+        with self.assertNumQueries(3):
+            instance_groups = TaskManagerInstanceGroups()
+
+        ig_instance_map = instance_groups.instance_groups
+
+        assert set(i.hostname for i in ig_instance_map['ig_small'].instances) == set(['i1'])
+        assert set(i.hostname for i in ig_instance_map['ig_large'].instances) == set(['i2', 'i3'])
+        assert set(i.hostname for i in ig_instance_map['default'].instances) == set(['i2'])

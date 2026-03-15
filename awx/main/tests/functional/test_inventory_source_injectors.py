@@ -5,12 +5,13 @@ import json
 import re
 from collections import namedtuple
 
+from awx_plugins.interfaces._temporary_private_container_api import get_incontainer_path
+
 from awx.main.tasks.jobs import RunInventoryUpdate
 from awx.main.models import InventorySource, Credential, CredentialType, UnifiedJob, ExecutionEnvironment
-from awx.main.constants import CLOUD_PROVIDERS, STANDARD_INVENTORY_UPDATE_ENV
+from awx.main.constants import STANDARD_INVENTORY_UPDATE_ENV
 from awx.main.tests import data
-from awx.main.utils.execution_environments import to_container_path
-
+from awx.main.utils.plugins import discover_available_cloud_provider_plugin_names
 from django.conf import settings
 
 DATA = os.path.join(os.path.dirname(data.__file__), 'inventory')
@@ -46,6 +47,8 @@ def generate_fake_var(element):
 
 def credential_kind(source):
     """Given the inventory source kind, return expected credential kind"""
+    if source == 'openshift_virtualization':
+        return 'kubernetes_bearer_token'
     return source.replace('ec2', 'aws')
 
 
@@ -107,12 +110,13 @@ def read_content(private_data_dir, raw_env, inventory_update):
             for filename in os.listdir(os.path.join(private_data_dir, subdir)):
                 filename_list.append(os.path.join(subdir, filename))
     filename_list = sorted(filename_list, key=lambda fn: inverse_env.get(os.path.join(private_data_dir, fn), [fn])[0])
+    inventory_content = ""
     for filename in filename_list:
         if filename in ('args', 'project'):
             continue  # Ansible runner
         abs_file_path = os.path.join(private_data_dir, filename)
         file_aliases[abs_file_path] = filename
-        runner_path = to_container_path(abs_file_path, private_data_dir)
+        runner_path = get_incontainer_path(abs_file_path, private_data_dir)
         if runner_path in inverse_env:
             referenced_paths.add(abs_file_path)
             alias = 'file_reference'
@@ -121,7 +125,7 @@ def read_content(private_data_dir, raw_env, inventory_update):
                     break
                 alias = 'file_reference_{}'.format(i)
             else:
-                raise RuntimeError('Test not able to cope with >10 references by env vars. ' 'Something probably went very wrong.')
+                raise RuntimeError('Test not able to cope with >10 references by env vars. Something probably went very wrong.')
             file_aliases[abs_file_path] = alias
             for env_key in inverse_env[runner_path]:
                 env[env_key] = '{{{{ {} }}}}'.format(alias)
@@ -130,6 +134,7 @@ def read_content(private_data_dir, raw_env, inventory_update):
                 dir_contents[abs_file_path] = f.read()
             # Declare a reference to inventory plugin file if it exists
             if abs_file_path.endswith('.yml') and 'plugin: ' in dir_contents[abs_file_path]:
+                inventory_content = dir_contents[abs_file_path]
                 referenced_paths.add(abs_file_path)  # used as inventory file
             elif cache_file_regex.match(abs_file_path):
                 file_aliases[abs_file_path] = 'cache_file'
@@ -150,11 +155,18 @@ def read_content(private_data_dir, raw_env, inventory_update):
                 referenced_paths.add(target_path)
                 dir_contents[abs_file_path] = file_content.replace(target_path, '{{ ' + other_alias + ' }}')
 
+    # The env/settings file should be ignored, nothing needs to reference it as its picked up directly from runner
+    ignore_files = [os.path.join(private_data_dir, 'env', 'settings')]
+
     # build dict content which is the directory contents keyed off the file aliases
     content = {}
     for abs_file_path, file_content in dir_contents.items():
         # assert that all files laid down are used
-        if abs_file_path not in referenced_paths:
+        if (
+            abs_file_path not in referenced_paths
+            and get_incontainer_path(abs_file_path, private_data_dir) not in inventory_content
+            and abs_file_path not in ignore_files
+        ):
             raise AssertionError(
                 "File {} is not referenced. References and files:\n{}\n{}".format(abs_file_path, json.dumps(env, indent=4), json.dumps(dir_contents, indent=4))
             )
@@ -179,15 +191,14 @@ def create_reference_data(source_dir, env, content):
             json.dump(env, f, indent=4, sort_keys=True)
 
 
+@mock.patch('awx_plugins.interfaces._temporary_private_licensing_api.detect_server_product_name', return_value='NOT-AWX')
 @pytest.mark.django_db
-@pytest.mark.parametrize('this_kind', CLOUD_PROVIDERS)
-def test_inventory_update_injected_content(this_kind, inventory, fake_credential_factory, mock_me):
+@pytest.mark.parametrize('this_kind', discover_available_cloud_provider_plugin_names())
+def test_inventory_update_injected_content(product_name, this_kind, inventory, fake_credential_factory, mock_me):
     ExecutionEnvironment.objects.create(name='Control Plane EE', managed=True)
     ExecutionEnvironment.objects.create(name='Default Job EE', managed=False)
 
     injector = InventorySource.injectors[this_kind]
-    if injector.plugin_name is None:
-        pytest.skip('Use of inventory plugin is not enabled for this source')
 
     src_vars = dict(base_source_var='value_of_var')
     src_vars['plugin'] = injector.get_proper_name()
@@ -197,7 +208,7 @@ def test_inventory_update_injected_content(this_kind, inventory, fake_credential
         source_vars=src_vars,
     )
     inventory_source.credentials.add(fake_credential_factory(this_kind))
-    inventory_update = inventory_source.create_unified_job()
+    inventory_update = inventory_source.create_unified_job(_eager_fields={'status': 'waiting'})
     task = RunInventoryUpdate()
 
     def substitute_run(awx_receptor_job):
@@ -211,6 +222,10 @@ def test_inventory_update_injected_content(this_kind, inventory, fake_credential
         private_data_dir = envvars.pop('AWX_PRIVATE_DATA_DIR')
         assert envvars.pop('ANSIBLE_INVENTORY_ENABLED') == 'auto'
         set_files = bool(os.getenv("MAKE_INVENTORY_REFERENCE_FILES", 'false').lower()[0] not in ['f', '0'])
+
+        # Ensure the directory exists before trying to list/read it
+        os.makedirs(private_data_dir, exist_ok=True)
+
         env, content = read_content(private_data_dir, envvars, inventory_update)
 
         # Assert inventory plugin inventory file is in private_data_dir
@@ -219,7 +234,7 @@ def test_inventory_update_injected_content(this_kind, inventory, fake_credential
             len([True for k in content.keys() if k.endswith(inventory_filename)]) > 0
         ), f"'{inventory_filename}' file not found in inventory update runtime files {content.keys()}"
 
-        env.pop('ANSIBLE_COLLECTIONS_PATHS', None)  # collection paths not relevant to this test
+        env.pop('ANSIBLE_COLLECTIONS_PATH', None)
         base_dir = os.path.join(DATA, 'plugins')
         if not os.path.exists(base_dir):
             os.mkdir(base_dir)
@@ -231,7 +246,7 @@ def test_inventory_update_injected_content(this_kind, inventory, fake_credential
             source_dir = os.path.join(base_dir, this_kind)  # this_kind is a global
 
             if not os.path.exists(source_dir):
-                raise FileNotFoundError('Maybe you never made reference files? ' 'MAKE_INVENTORY_REFERENCE_FILES=true py.test ...\noriginal: {}')
+                raise FileNotFoundError('Maybe you never made reference files? MAKE_INVENTORY_REFERENCE_FILES=true py.test ...\noriginal: {}')
             files_dir = os.path.join(source_dir, 'files')
             try:
                 expected_file_list = os.listdir(files_dir)
@@ -258,5 +273,6 @@ def test_inventory_update_injected_content(this_kind, inventory, fake_credential
         with mock.patch.object(UnifiedJob, 'websocket_emit_status', mock.Mock()):
             # The point of this test is that we replace run with assertions
             with mock.patch('awx.main.tasks.receptor.AWXReceptorJob.run', substitute_run):
-                # so this sets up everything for a run and then yields control over to substitute_run
-                task.run(inventory_update.pk)
+                with mock.patch('awx.main.tasks.jobs.create_partition'):
+                    # so this sets up everything for a run and then yields control over to substitute_run
+                    task.run(inventory_update.pk)

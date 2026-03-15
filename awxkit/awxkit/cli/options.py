@@ -6,12 +6,9 @@ import re
 import sys
 import yaml
 
-from distutils.util import strtobool
-
 from .custom import CustomAction
-from .format import add_output_formatting_arguments
+from .format import add_output_formatting_arguments, strtobool
 from .resource import DEPRECATED_RESOURCES_REVERSE
-
 
 UNIQUENESS_RULES = {
     'me': ('id', 'username'),
@@ -55,15 +52,25 @@ def pk_or_name(v2, model_name, value, page=None):
             return int(results.results[0].id)
         if results.count > 1:
             raise argparse.ArgumentTypeError(
-                'Multiple {0} exist with that {1}. ' 'To look up an ID, run:\n' 'awx {0} list --{1} "{2}" -f human'.format(model_name, identity, value)
+                'Multiple {0} exist with that {1}. To look up an ID, run:\nawx {0} list --{1} "{2}" -f human'.format(model_name, identity, value)
             )
         raise argparse.ArgumentTypeError('Could not find any {0} with that {1}.'.format(model_name, identity))
 
     return value
 
 
-class ResourceOptionsParser(object):
+class JsonDumpsAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        # This Action gets called repeatedly on each instance of the flag that it is
+        # tied to, and unfortunately doesn't come with a good way of noticing we are at
+        # the end. So it's necessary to keep doing json.loads and json.dumps each time.
 
+        json_vars = json.loads(getattr(namespace, self.dest, None) or '{}')
+        json_vars.update(values)
+        setattr(namespace, self.dest, json.dumps(json_vars))
+
+
+class ResourceOptionsParser(object):
     deprecated = False
 
     def __init__(self, v2, page, resource, parser):
@@ -95,6 +102,18 @@ class ResourceOptionsParser(object):
         if '299' in warning and 'deprecated' in warning:
             self.deprecated = True
         self.allowed_options = options.headers.get('Allow', '').split(', ')
+        # If the user can PUT on the detail endpoint but doesn't have
+        # POST on the list endpoint, use the detail endpoint's
+        # action schema so that 'modify' fields are populated.
+        if 'POST' not in self.options and 'PUT' in self.allowed_options:
+            try:
+                detail_actions = options.json().get('actions', {})
+            except Exception:
+                detail_actions = {}
+            if 'PUT' in detail_actions:
+                self.options['PUT'] = detail_actions['PUT']
+            elif 'GET' in detail_actions:
+                self.options['PUT'] = detail_actions['GET']
 
     def build_list_actions(self):
         action_map = {
@@ -102,14 +121,27 @@ class ResourceOptionsParser(object):
             'POST': 'create',
         }
         for method, action in self.options.items():
+            # Skip 'PUT', which may be added by get_allowed_options
+            # and is handled separately by build_detail_actions
+            if method not in action_map:
+                continue
             method = action_map[method]
-            parser = self.parser.add_parser(method, help='')
+            parser = self.parser.add_parser(method, help='', add_help=True)
             if method == 'list':
                 parser.add_argument(
                     '--all',
                     dest='all_pages',
                     action='store_true',
-                    help=('fetch all pages of content from the API when ' 'returning results (instead of just the first page)'),
+                    help=('fetch all pages of content from the API when returning results (instead of just the first page)'),
+                )
+                parser.add_argument(
+                    '--order_by',
+                    dest='order_by',
+                    help=(
+                        'order results by given field name, '
+                        'prefix the field name with a dash (-) to sort in reverse eg --order_by=\'-name\','
+                        'multiple sorting fields may be specified by separating the field names with a comma (,)'
+                    ),
                 )
                 add_output_formatting_arguments(parser, {})
 
@@ -120,7 +152,7 @@ class ResourceOptionsParser(object):
         if 'DELETE' in self.allowed_options:
             allowed.append('delete')
         for method in allowed:
-            parser = self.parser.add_parser(method, help='')
+            parser = self.parser.add_parser(method, help='', add_help=True)
             self.parser.choices[method].add_argument(
                 'id', type=functools.partial(pk_or_name, self.v2, self.resource), help='the ID (or unique name) of the resource'
             )
@@ -132,6 +164,7 @@ class ResourceOptionsParser(object):
         for k, param in self.options.get(http_method, {}).items():
             required = method == 'create' and param.get('required', False) is True
             help_text = param.get('help_text', '')
+            args = ['--{}'.format(k)]
 
             if method == 'list':
                 if k == 'id':
@@ -143,7 +176,10 @@ class ResourceOptionsParser(object):
             if method == 'list' and param.get('filterable') is False:
                 continue
 
-            def json_or_yaml(v):
+            def list_of_json_or_yaml(v):
+                return json_or_yaml(v, expected_type=list)
+
+            def json_or_yaml(v, expected_type=dict):
                 if v.startswith('@'):
                     v = open(os.path.expanduser(v[1:])).read()
                 try:
@@ -154,20 +190,18 @@ class ResourceOptionsParser(object):
                     except Exception:
                         raise argparse.ArgumentTypeError("{} is not valid JSON or YAML".format(v))
 
-                if not isinstance(parsed, dict):
+                if not isinstance(parsed, expected_type):
                     raise argparse.ArgumentTypeError("{} is not valid JSON or YAML".format(v))
 
-                for k, v in parsed.items():
-                    # add support for file reading at top-level JSON keys
-                    # (to make things like SSH key data easier to work with)
-                    if isinstance(v, str) and v.startswith('@'):
-                        path = os.path.expanduser(v[1:])
-                        parsed[k] = open(path).read()
+                if expected_type is dict:
+                    for k, v in parsed.items():
+                        # add support for file reading at top-level JSON keys
+                        # (to make things like SSH key data easier to work with)
+                        if isinstance(v, str) and v.startswith('@'):
+                            path = os.path.expanduser(v[1:])
+                            parsed[k] = open(path).read()
 
                 return parsed
-
-            def jsonstr(v):
-                return json.dumps(json_or_yaml(v))
 
             kwargs = {
                 'help': help_text,
@@ -235,16 +269,37 @@ class ResourceOptionsParser(object):
             if (self.resource in ('job_templates', 'workflow_job_templates') and k == 'extra_vars') or (
                 self.resource in ('inventory', 'groups', 'hosts') and k == 'variables'
             ):
-                kwargs['type'] = jsonstr
+                kwargs['type'] = json_or_yaml
+                kwargs['action'] = JsonDumpsAction
+
+                if k == 'extra_vars':
+                    args.append('-e')
+
+            # special handling for bulk endpoints
+            if self.resource == 'bulk':
+                if method == "host_create":
+                    if k == "inventory":
+                        kwargs['required'] = required = True
+                    if k == 'hosts':
+                        kwargs['type'] = list_of_json_or_yaml
+                        kwargs['required'] = required = True
+                if method == "host_delete":
+                    if k == 'hosts':
+                        kwargs['type'] = list_of_json_or_yaml
+                        kwargs['required'] = required = True
+                if method == "job_launch":
+                    if k == 'jobs':
+                        kwargs['type'] = list_of_json_or_yaml
+                        kwargs['required'] = required = True
 
             if required:
                 if required_group is None:
                     required_group = self.parser.choices[method].add_argument_group('required arguments')
                     # put the required group first (before the optional args group)
                     self.parser.choices[method]._action_groups.reverse()
-                required_group.add_argument('--{}'.format(k), **kwargs)
+                required_group.add_argument(*args, **kwargs)
             else:
-                self.parser.choices[method].add_argument('--{}'.format(k), **kwargs)
+                self.parser.choices[method].add_argument(*args, **kwargs)
 
     def handle_custom_actions(self):
         for _, action in CustomAction.registry.items():

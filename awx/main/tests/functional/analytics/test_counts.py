@@ -26,6 +26,7 @@ def test_empty():
         "workflow_job_template": 0,
         "unified_job": 0,
         "pending_jobs": 0,
+        "database_connections": 1,
     }
 
 
@@ -65,7 +66,7 @@ def test_database_counts(organization_factory, job_template_factory, workflow_jo
 
 @pytest.mark.django_db
 def test_inventory_counts(organization_factory, inventory_factory):
-    (inv1, inv2, inv3) = [inventory_factory(f"inv-{i}") for i in range(3)]
+    inv1, inv2, inv3 = [inventory_factory(f"inv-{i}") for i in range(3)]
 
     s1 = inv1.inventory_sources.create(name="src1", source="ec2")
     s2 = inv1.inventory_sources.create(name="src2", source="file")

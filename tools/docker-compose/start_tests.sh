@@ -1,14 +1,12 @@
 #!/bin/bash
-set +x
+set -euo pipefail
 
 cd /awx_devel
 make clean
 make awx-link
 
-cp tools/docker-compose/ansible/roles/sources/files/local_settings.py awx/settings/local_settings.py
-
-if [[ ! $@ ]]; then
+if [[ $# -eq 0 ]]; then
     make test
 else
-    make $@
+    make "$@"
 fi

@@ -1,7 +1,10 @@
+import shutil
+import os
+from uuid import uuid4
+
 import pytest
 
-from awx.main.utils.execution_environments import to_container_path, to_host_path
-
+from awx_plugins.interfaces._temporary_private_container_api import get_incontainer_path
 
 private_data_dir = '/tmp/pdd_iso/awx_xxx'
 
@@ -10,26 +13,33 @@ private_data_dir = '/tmp/pdd_iso/awx_xxx'
     'container_path,host_path',
     [
         ('/runner', private_data_dir),
-        ('/runner/foo', '{0}/foo'.format(private_data_dir)),
-        ('/runner/foo/bar', '{0}/foo/bar'.format(private_data_dir)),
-        ('/runner{0}'.format(private_data_dir), '{0}{0}'.format(private_data_dir)),
+        ('/runner/foo', f'{private_data_dir}/foo'),
+        ('/runner', f'{private_data_dir}/foobar/..'),  # private_data_dir path needs to be resolved
+        ('/runner/bar', f'{private_data_dir}/bar/foo/..'),
+        ('/runner/foo/bar', f'{private_data_dir}/foo/bar'),
+        (f'/runner{private_data_dir}', f'{private_data_dir}{private_data_dir}'),
     ],
 )
 def test_switch_paths(container_path, host_path):
-    assert to_container_path(host_path, private_data_dir) == container_path
-    assert to_host_path(container_path, private_data_dir) == host_path
+    assert get_incontainer_path(host_path, private_data_dir) == container_path
 
 
-@pytest.mark.parametrize(
-    'container_path',
-    [
-        ('/foobar'),
-        ('/runner/..'),
-    ],
-)
-def test_invalid_container_path(container_path):
-    with pytest.raises(RuntimeError):
-        to_host_path(container_path, private_data_dir)
+def test_symlink_isolation_dir(request):
+    rand_str = str(uuid4())[:8]
+    dst_path = f'/tmp/ee_{rand_str}_symlink_dst'
+    src_path = f'/tmp/ee_{rand_str}_symlink_src'
+
+    def remove_folders():
+        os.unlink(dst_path)
+        shutil.rmtree(src_path)
+
+    request.addfinalizer(remove_folders)
+    os.mkdir(src_path)
+    os.symlink(src_path, dst_path)
+
+    pdd = f'{dst_path}/awx_xxx'
+
+    assert get_incontainer_path(f'{pdd}/env/tmp1234', pdd) == '/runner/env/tmp1234'
 
 
 @pytest.mark.parametrize(
@@ -42,4 +52,4 @@ def test_invalid_container_path(container_path):
 )
 def test_invalid_host_path(host_path):
     with pytest.raises(RuntimeError):
-        to_container_path(host_path, private_data_dir)
+        get_incontainer_path(host_path, private_data_dir)

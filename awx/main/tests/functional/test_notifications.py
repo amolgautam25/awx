@@ -10,12 +10,13 @@ from awx.main.models.notifications import NotificationTemplate, Notification
 from awx.main.models.inventory import Inventory, InventorySource
 from awx.main.models.jobs import JobTemplate
 
+from django.test.utils import override_settings
+
 
 @pytest.mark.django_db
 def test_get_notification_template_list(get, user, notification_template):
     url = reverse('api:notification_template_list')
-    response = get(url, user('admin', True))
-    assert response.status_code == 200
+    response = get(url, user('admin', True), expect=200)
     assert len(response.data['results']) == 1
 
 
@@ -33,8 +34,8 @@ def test_basic_parameterization(get, post, user, organization):
             notification_configuration=dict(url="http://localhost", disable_ssl_verification=False, headers={"Test": "Header"}),
         ),
         u,
+        expect=201,
     )
-    assert response.status_code == 201
     url = reverse('api:notification_template_detail', kwargs={'pk': response.data['id']})
     response = get(url, u)
     assert 'related' in response.data
@@ -67,12 +68,13 @@ def test_encrypted_subfields(get, post, user, organization):
             notification_configuration=dict(account_sid="dummy", account_token="shouldhide", from_number="+19999999999", to_numbers=["9998887777"]),
         ),
         u,
+        expect=201,
     )
-    assert response.status_code == 201
     notification_template_actual = NotificationTemplate.objects.get(id=response.data['id'])
     url = reverse('api:notification_template_detail', kwargs={'pk': response.data['id']})
     response = get(url, u)
     assert response.data['notification_configuration']['account_token'] == "$encrypted$"
+
     with mock.patch.object(notification_template_actual.notification_class, "send_messages", assert_send):
         notification_template_actual.send("Test", {'body': "Test"})
 
@@ -93,8 +95,8 @@ def test_inherited_notification_templates(get, post, user, organization, project
                 notification_configuration=dict(url="http://localhost", disable_ssl_verification=False, headers={"Test": "Header"}),
             ),
             u,
+            expect=201,
         )
-        assert response.status_code == 201
         notification_templates.append(response.data['id'])
     i = Inventory.objects.create(name='test', organization=organization)
     i.save()
@@ -119,8 +121,7 @@ def test_disallow_delete_when_notifications_pending(delete, user, notification_t
     u = user('superuser', True)
     url = reverse('api:notification_template_detail', kwargs={'pk': notification_template.id})
     Notification.objects.create(notification_template=notification_template, status='pending')
-    response = delete(url, user=u)
-    assert response.status_code == 405
+    delete(url, user=u, expect=405)
 
 
 @pytest.mark.django_db
@@ -130,9 +131,8 @@ def test_notification_template_list_includes_notification_errors(get, user, noti
     Notification.objects.create(notification_template=notification_template, status='successful')
     url = reverse('api:notification_template_list')
     u = user('superuser', True)
-    response = get(url, user=u)
+    response = get(url, user=u, expect=200)
 
-    assert response.status_code == 200
     notifications = response.data['results'][0]['summary_fields']['recent_notifications']
     assert len(notifications) == 3
     statuses = [n['status'] for n in notifications]
@@ -160,10 +160,10 @@ def test_custom_environment_injection(post, user, organization):
             notification_configuration=dict(url="https://example.org", disable_ssl_verification=False, http_method="POST", headers={"Test": "Header"}),
         ),
         u,
+        expect=201,
     )
-    assert response.status_code == 201
     template = NotificationTemplate.objects.get(pk=response.data['id'])
-    with pytest.raises(ConnectionError), mock.patch('django.conf.settings.AWX_TASK_ENV', {'HTTPS_PROXY': '192.168.50.100:1234'}), mock.patch.object(
+    with pytest.raises(ConnectionError), override_settings(AWX_TASK_ENV={'HTTPS_PROXY': '192.168.50.100:1234'}), mock.patch.object(
         HTTPAdapter, 'send'
     ) as fake_send:
 
@@ -173,3 +173,73 @@ def test_custom_environment_injection(post, user, organization):
 
         fake_send.side_effect = _send_side_effect
         template.send('subject', 'message')
+
+
+def mock_post(*args, **kwargs):
+    class MockGoodResponse:
+        def __init__(self):
+            self.status_code = 200
+
+    class MockRedirectResponse:
+        def __init__(self):
+            self.status_code = 301
+            self.headers = {"Location": "http://goodendpoint"}
+
+    if kwargs['url'] == "http://goodendpoint":
+        return MockGoodResponse()
+    else:
+        return MockRedirectResponse()
+
+
+@pytest.mark.django_db
+@mock.patch('requests.post', side_effect=mock_post)
+def test_webhook_notification_pointed_to_a_redirect_launch_endpoint(post, admin, organization):
+    n1 = NotificationTemplate.objects.create(
+        name="test-webhook",
+        description="test webhook",
+        organization=organization,
+        notification_type="webhook",
+        notification_configuration=dict(
+            url="http://some.fake.url",
+            disable_ssl_verification=True,
+            http_method="POST",
+            headers={
+                "Content-Type": "application/json",
+            },
+            username=admin.username,
+            password=admin.password,
+        ),
+        messages={
+            "success": {"message": "", "body": "{}"},
+        },
+    )
+
+    assert n1.send("", n1.messages.get("success").get("body")) == 1
+
+
+@pytest.mark.django_db
+def test_update_notification_template(admin, notification_template):
+    notification_template.messages['workflow_approval'] = {
+        "running": {
+            "message": None,
+            "body": None,
+        }
+    }
+    notification_template.save()
+
+    workflow_approval_message = {
+        "approved": {
+            "message": None,
+            "body": None,
+        },
+        "running": {
+            "message": "test-message",
+            "body": None,
+        },
+    }
+    notification_template.messages['workflow_approval'] = workflow_approval_message
+    notification_template.save()
+
+    subevents = sorted(notification_template.messages["workflow_approval"].keys())
+    assert subevents == ["approved", "running"]
+    assert notification_template.messages['workflow_approval'] == workflow_approval_message

@@ -2,6 +2,7 @@
 import logging
 
 # Django
+from django.core.checks import Error
 from django.utils.translation import gettext_lazy as _
 
 # Django REST Framework
@@ -10,7 +11,8 @@ from rest_framework import serializers
 # AWX
 from awx.conf import fields, register, register_validate
 from awx.main.models import ExecutionEnvironment
-
+from awx.main.constants import SUBSCRIPTION_USAGE_MODEL_UNIQUE_HOSTS
+from awx.main.tasks.policy import OPA_AUTH_TYPES
 
 logger = logging.getLogger('awx.main.conf')
 
@@ -45,10 +47,7 @@ register(
     'MANAGE_ORGANIZATION_AUTH',
     field_class=fields.BooleanField,
     label=_('Organization Admins Can Manage Users and Teams'),
-    help_text=_(
-        'Controls whether any Organization Admin has the privileges to create and manage users and teams. '
-        'You may want to disable this ability if you are using an LDAP or SAML integration.'
-    ),
+    help_text=_('Controls whether any Organization Admin has the privileges to create and manage users and teams.'),
     category=_('System'),
     category_slug='system',
 )
@@ -95,6 +94,21 @@ register(
 )
 
 register(
+    'CSRF_TRUSTED_ORIGINS',
+    default=[],
+    field_class=fields.StringListField,
+    label=_('CSRF Trusted Origins List'),
+    help_text=_(
+        "If the service is behind a reverse proxy/load balancer, use this setting "
+        "to configure the schema://addresses from which the service should trust "
+        "Origin header values. "
+    ),
+    category=_('System'),
+    category_slug='system',
+    hidden=True,
+)
+
+register(
     'LICENSE',
     field_class=fields.DictField,
     default=lambda: {},
@@ -111,8 +125,8 @@ register(
     allow_blank=True,
     encrypted=False,
     read_only=False,
-    label=_('Red Hat customer username'),
-    help_text=_('This username is used to send data to Insights for Ansible Automation Platform'),
+    label=_('Red Hat Client ID for Analytics'),
+    help_text=_('Client ID used to send data to Automation Analytics'),
     category=_('System'),
     category_slug='system',
 )
@@ -124,8 +138,8 @@ register(
     allow_blank=True,
     encrypted=True,
     read_only=False,
-    label=_('Red Hat customer password'),
-    help_text=_('This password is used to send data to Insights for Ansible Automation Platform'),
+    label=_('Red Hat Client Secret for Analytics'),
+    help_text=_('Client secret used to send data to Automation Analytics'),
     category=_('System'),
     category_slug='system',
 )
@@ -137,10 +151,11 @@ register(
     allow_blank=True,
     encrypted=False,
     read_only=False,
-    label=_('Red Hat or Satellite username'),
-    help_text=_('This username is used to retrieve subscription and content information'),  # noqa
+    label=_('Red Hat Username for Subscriptions'),
+    help_text=_('Username used to retrieve subscription and content information'),  # noqa
     category=_('System'),
     category_slug='system',
+    hidden=True,
 )
 
 register(
@@ -150,10 +165,40 @@ register(
     allow_blank=True,
     encrypted=True,
     read_only=False,
-    label=_('Red Hat or Satellite password'),
-    help_text=_('This password is used to retrieve subscription and content information'),  # noqa
+    label=_('Red Hat Password for Subscriptions'),
+    help_text=_('Password used to retrieve subscription and content information'),  # noqa
     category=_('System'),
     category_slug='system',
+    hidden=True,
+)
+
+
+register(
+    'SUBSCRIPTIONS_CLIENT_ID',
+    field_class=fields.CharField,
+    default='',
+    allow_blank=True,
+    encrypted=False,
+    read_only=False,
+    label=_('Red Hat Client ID for Subscriptions'),
+    help_text=_('Client ID used to retrieve subscription and content information'),  # noqa
+    category=_('System'),
+    category_slug='system',
+    hidden=True,
+)
+
+register(
+    'SUBSCRIPTIONS_CLIENT_SECRET',
+    field_class=fields.CharField,
+    default='',
+    allow_blank=True,
+    encrypted=True,
+    read_only=False,
+    label=_('Red Hat Client Secret for Subscriptions'),
+    help_text=_('Client secret used to retrieve subscription and content information'),  # noqa
+    category=_('System'),
+    category_slug='system',
+    hidden=True,
 )
 
 register(
@@ -162,8 +207,8 @@ register(
     default='https://example.com',
     schemes=('http', 'https'),
     allow_plain_hostname=True,  # Allow hostname only without TLD.
-    label=_('Insights for Ansible Automation Platform upload URL'),
-    help_text=_('This setting is used to to configure the upload URL for data collection for Red Hat Insights.'),
+    label=_('Automation Analytics upload URL'),
+    help_text=_('This setting is used to to configure the upload URL for data collection for Automation Analytics.'),
     category=_('System'),
     category_slug='system',
 )
@@ -224,7 +269,6 @@ register(
     help_text=_('List of modules allowed to be used by ad-hoc jobs.'),
     category=_('Jobs'),
     category_slug='jobs',
-    required=False,
 )
 
 register(
@@ -235,7 +279,6 @@ register(
         ('never', _('Never')),
         ('template', _('Only On Job Template Definitions')),
     ],
-    required=True,
     label=_('When can extra variables contain Jinja templates?'),
     help_text=_(
         'Ansible allows variable substitution via the Jinja2 templating '
@@ -260,7 +303,6 @@ register(
 register(
     'AWX_ISOLATION_SHOW_PATHS',
     field_class=fields.StringListIsolatedPathField,
-    required=False,
     label=_('Paths to expose to isolated jobs'),
     help_text=_(
         'List of paths that would otherwise be hidden to expose to isolated jobs. Enter one path per line. '
@@ -283,6 +325,16 @@ register(
 )
 
 register(
+    'AWX_RUNNER_KEEPALIVE_SECONDS',
+    field_class=fields.IntegerField,
+    label=_('K8S Ansible Runner Keep-Alive Message Interval'),
+    help_text=_('Only applies to jobs running in a Container Group. If not 0, send a message every so-many seconds to keep connection open.'),
+    category=_('Jobs'),
+    category_slug='jobs',
+    placeholder=240,  # intended to be under common 5 minute idle timeout
+)
+
+register(
     'GALAXY_TASK_ENV',
     field_class=fields.KeyValueField,
     label=_('Environment Variables for Galaxy Commands'),
@@ -299,8 +351,8 @@ register(
     'INSIGHTS_TRACKING_STATE',
     field_class=fields.BooleanField,
     default=False,
-    label=_('Gather data for Insights for Ansible Automation Platform'),
-    help_text=_('Enables the service to gather data on automation and send it to Red Hat Insights.'),
+    label=_('Gather data for Automation Analytics'),
+    help_text=_('Enables the service to gather data on automation and send it to Automation Analytics.'),
     category=_('System'),
     category_slug='system',
 )
@@ -416,7 +468,6 @@ register(
 register(
     'AWX_ANSIBLE_CALLBACK_PLUGINS',
     field_class=fields.StringListField,
-    required=False,
     label=_('Ansible Callback Plugins'),
     help_text=_('List of paths to search for extra callback plugins to be used when running jobs. Enter one path per line.'),
     category=_('Jobs'),
@@ -446,7 +497,7 @@ register(
     label=_('Default Job Idle Timeout'),
     help_text=_(
         'If no output is detected from ansible in this number of seconds the execution will be terminated. '
-        'Use value of 0 to used default idle_timeout is 600s.'
+        'Use value of 0 to indicate that no idle timeout should be imposed.'
     ),
     category=_('Jobs'),
     category_slug='jobs',
@@ -530,7 +581,6 @@ register(
     help_text=_('Port on Logging Aggregator to send logs to (if required and not provided in Logging Aggregator).'),
     category=_('Logging'),
     category_slug='logging',
-    required=False,
 )
 register(
     'LOG_AGGREGATOR_TYPE',
@@ -552,7 +602,6 @@ register(
     help_text=_('Username for external log aggregator (if required; HTTP/s only).'),
     category=_('Logging'),
     category_slug='logging',
-    required=False,
 )
 register(
     'LOG_AGGREGATOR_PASSWORD',
@@ -564,12 +613,11 @@ register(
     help_text=_('Password or authentication token for external log aggregator (if required; HTTP/s only).'),
     category=_('Logging'),
     category_slug='logging',
-    required=False,
 )
 register(
     'LOG_AGGREGATOR_LOGGERS',
     field_class=fields.StringListField,
-    default=['awx', 'activity_stream', 'job_events', 'system_tracking'],
+    default=['awx', 'activity_stream', 'job_events', 'system_tracking', 'broadcast_websocket', 'job_lifecycle'],
     label=_('Loggers Sending Data to Log Aggregator Form'),
     help_text=_(
         'List of loggers that will send HTTP logs to the collector, these can '
@@ -577,7 +625,9 @@ register(
         'awx - service logs\n'
         'activity_stream - activity stream records\n'
         'job_events - callback data from Ansible job events\n'
-        'system_tracking - facts gathered from scan jobs.'
+        'system_tracking - facts gathered from scan jobs\n'
+        'broadcast_websocket - errors pertaining to websockets broadcast metrics\n'
+        'job_lifecycle - logs related to processing of a job\n'
     ),
     category=_('Logging'),
     category_slug='logging',
@@ -669,15 +719,33 @@ register(
     category_slug='logging',
 )
 register(
-    'LOG_AGGREGATOR_MAX_DISK_USAGE_GB',
+    'LOG_AGGREGATOR_ACTION_QUEUE_SIZE',
+    field_class=fields.IntegerField,
+    default=131072,
+    min_value=1,
+    label=_('Maximum number of messages that can be stored in the log action queue'),
+    help_text=_(
+        'Defines how large the rsyslog action queue can grow in number of messages '
+        'stored. This can have an impact on memory utilization. When the queue '
+        'reaches 75% of this number, the queue will start writing to disk '
+        '(queue.highWatermark in rsyslog). When it reaches 90%, NOTICE, INFO, and '
+        'DEBUG messages will start to be discarded (queue.discardMark with '
+        'queue.discardSeverity=5).'
+    ),
+    category=_('Logging'),
+    category_slug='logging',
+)
+register(
+    'LOG_AGGREGATOR_ACTION_MAX_DISK_USAGE_GB',
     field_class=fields.IntegerField,
     default=1,
     min_value=1,
-    label=_('Maximum disk persistance for external log aggregation (in GB)'),
+    label=_('Maximum disk persistence for rsyslogd action queuing (in GB)'),
     help_text=_(
-        'Amount of data to store (in gigabytes) during an outage of '
-        'the external log aggregator (defaults to 1). '
-        'Equivalent to the rsyslogd queue.maxdiskspace setting.'
+        'Amount of data to store (in gigabytes) if an rsyslog action takes time '
+        'to process an incoming message (defaults to 1). '
+        'Equivalent to the rsyslogd queue.maxdiskspace setting on the action (e.g. omhttp). '
+        'It stores files in the directory specified by LOG_AGGREGATOR_MAX_DISK_USAGE_PATH.'
     ),
     category=_('Logging'),
     category_slug='logging',
@@ -727,15 +795,16 @@ register(
 register(
     'AUTOMATION_ANALYTICS_LAST_GATHER',
     field_class=fields.DateTimeField,
-    label=_('Last gather date for Insights for Ansible Automation Platform.'),
+    label=_('Last gather date for Automation Analytics.'),
     allow_null=True,
     category=_('System'),
     category_slug='system',
+    hidden=True,
 )
 register(
     'AUTOMATION_ANALYTICS_LAST_ENTRIES',
     field_class=fields.CharField,
-    label=_('Last gathered entries from the data collection service of Insights for Ansible Automation Platform'),
+    label=_('Last gathered entries from the data collection service of Automation Analytics'),
     default='',
     allow_blank=True,
     category=_('System'),
@@ -746,7 +815,7 @@ register(
 register(
     'AUTOMATION_ANALYTICS_GATHER_INTERVAL',
     field_class=fields.IntegerField,
-    label=_('Insights for Ansible Automation Platform Gather Interval'),
+    label=_('Automation Analytics Gather Interval'),
     help_text=_('Interval (in seconds) between data gathering.'),
     default=14400,  # every 4 hours
     min_value=1800,  # every 30 minutes
@@ -762,6 +831,127 @@ register(
     category=_('System'),
     category_slug='system',
     help_text=_('Indicates whether the instance is part of a kubernetes-based deployment.'),
+)
+
+register(
+    'BULK_JOB_MAX_LAUNCH',
+    field_class=fields.IntegerField,
+    default=100,
+    label=_('Max jobs to allow bulk jobs to launch'),
+    help_text=_('Max jobs to allow bulk jobs to launch'),
+    category=_('Bulk Actions'),
+    category_slug='bulk',
+    hidden=True,
+)
+
+register(
+    'BULK_HOST_MAX_CREATE',
+    field_class=fields.IntegerField,
+    default=100,
+    label=_('Max number of hosts to allow to be created in a single bulk action'),
+    help_text=_('Max number of hosts to allow to be created in a single bulk action'),
+    category=_('Bulk Actions'),
+    category_slug='bulk',
+    hidden=True,
+)
+
+register(
+    'BULK_HOST_MAX_DELETE',
+    field_class=fields.IntegerField,
+    default=250,
+    label=_('Max number of hosts to allow to be deleted in a single bulk action'),
+    help_text=_('Max number of hosts to allow to be deleted in a single bulk action'),
+    category=_('Bulk Actions'),
+    category_slug='bulk',
+    hidden=True,
+)
+
+
+register(
+    'SUBSCRIPTION_USAGE_MODEL',
+    field_class=fields.ChoiceField,
+    choices=[
+        ('', _('No subscription. Deletion of host_metrics will not be considered for purposes of managed host counting')),
+        (
+            SUBSCRIPTION_USAGE_MODEL_UNIQUE_HOSTS,
+            _('Usage based on unique managed nodes in a large historical time frame and delete functionality for no longer used managed nodes'),
+        ),
+    ],
+    default='',
+    allow_blank=True,
+    label=_('Defines subscription usage model and shows Host Metrics'),
+    category=_('System'),
+    category_slug='system',
+)
+
+register(
+    'CLEANUP_HOST_METRICS_LAST_TS',
+    field_class=fields.DateTimeField,
+    label=_('Last cleanup date for HostMetrics'),
+    allow_null=True,
+    category=_('System'),
+    category_slug='system',
+    hidden=True,
+)
+
+register(
+    'HOST_METRIC_SUMMARY_TASK_LAST_TS',
+    field_class=fields.DateTimeField,
+    label=_('Last computing date of HostMetricSummaryMonthly'),
+    allow_null=True,
+    category=_('System'),
+    category_slug='system',
+    hidden=True,
+)
+
+register(
+    'AWX_CLEANUP_PATHS',
+    field_class=fields.BooleanField,
+    label=_('Enable or Disable tmp dir cleanup'),
+    default=True,
+    help_text=_('Enable or Disable TMP Dir cleanup'),
+    category=('Debug'),
+    category_slug='debug',
+)
+
+register(
+    'AWX_REQUEST_PROFILE',
+    field_class=fields.BooleanField,
+    label=_('Debug Web Requests'),
+    default=False,
+    help_text=_('Debug web request python timing'),
+    category=('Debug'),
+    category_slug='debug',
+)
+
+register(
+    'DEFAULT_CONTAINER_RUN_OPTIONS',
+    field_class=fields.StringListField,
+    label=_('Container Run Options'),
+    default=['--network', 'slirp4netns:enable_ipv6=true'],
+    help_text=_("List of options to pass to podman run example: ['--network', 'slirp4netns:enable_ipv6=true', '--log-level', 'debug']"),
+    category=('Jobs'),
+    category_slug='jobs',
+)
+
+register(
+    'RECEPTOR_RELEASE_WORK',
+    field_class=fields.BooleanField,
+    label=_('Release Receptor Work'),
+    default=True,
+    help_text=_('Release receptor work'),
+    category=('Debug'),
+    category_slug='debug',
+)
+
+register(
+    'RECEPTOR_KEEP_WORK_ON_ERROR',
+    field_class=fields.BooleanField,
+    label=_('Keep receptor work on error'),
+    default=False,
+    help_text=_('Prevent receptor work from being released on when error is detected'),
+    category=('Debug'),
+    category_slug='debug',
 )
 
 
@@ -790,3 +980,158 @@ def logging_validate(serializer, attrs):
 
 
 register_validate('logging', logging_validate)
+
+
+def csrf_trusted_origins_validate(serializer, attrs):
+    if not serializer.instance or not hasattr(serializer.instance, 'CSRF_TRUSTED_ORIGINS'):
+        return attrs
+    if 'CSRF_TRUSTED_ORIGINS' not in attrs:
+        return attrs
+    errors = []
+    for origin in attrs['CSRF_TRUSTED_ORIGINS']:
+        if "://" not in origin:
+            errors.append(
+                Error(
+                    "As of Django 4.0, the values in the CSRF_TRUSTED_ORIGINS "
+                    "setting must start with a scheme (usually http:// or "
+                    "https://) but found %s. See the release notes for details." % origin,
+                )
+            )
+    if errors:
+        error_messages = [error.msg for error in errors]
+        raise serializers.ValidationError(_('\n'.join(error_messages)))
+    return attrs
+
+
+register_validate('system', csrf_trusted_origins_validate)
+
+
+register(
+    'OPA_HOST',
+    field_class=fields.CharField,
+    label=_('OPA server hostname'),
+    default='',
+    help_text=_('The hostname used to connect to the OPA server. If empty, policy enforcement will be disabled.'),
+    category=('PolicyAsCode'),
+    category_slug='policyascode',
+    allow_blank=True,
+)
+
+register(
+    'OPA_PORT',
+    field_class=fields.IntegerField,
+    label=_('OPA server port'),
+    default=8181,
+    help_text=_('The port used to connect to the OPA server. Defaults to 8181.'),
+    category=('PolicyAsCode'),
+    category_slug='policyascode',
+)
+
+register(
+    'OPA_SSL',
+    field_class=fields.BooleanField,
+    label=_('Use SSL for OPA connection'),
+    default=False,
+    help_text=_('Enable or disable the use of SSL to connect to the OPA server. Defaults to false.'),
+    category=('PolicyAsCode'),
+    category_slug='policyascode',
+)
+
+register(
+    'OPA_AUTH_TYPE',
+    field_class=fields.ChoiceField,
+    label=_('OPA authentication type'),
+    choices=[OPA_AUTH_TYPES.NONE, OPA_AUTH_TYPES.TOKEN, OPA_AUTH_TYPES.CERTIFICATE],
+    default=OPA_AUTH_TYPES.NONE,
+    help_text=_('The authentication type that will be used to connect to the OPA server: "None", "Token", or "Certificate".'),
+    category=('PolicyAsCode'),
+    category_slug='policyascode',
+)
+
+register(
+    'OPA_AUTH_TOKEN',
+    field_class=fields.CharField,
+    label=_('OPA authentication token'),
+    default='',
+    help_text=_(
+        'The token for authentication to the OPA server. Required when OPA_AUTH_TYPE is "Token". If an authorization header is defined in OPA_AUTH_CUSTOM_HEADERS, it will be overridden by OPA_AUTH_TOKEN.'
+    ),
+    category=('PolicyAsCode'),
+    category_slug='policyascode',
+    allow_blank=True,
+    encrypted=True,
+)
+
+register(
+    'OPA_AUTH_CLIENT_CERT',
+    field_class=fields.CharField,
+    label=_('OPA client certificate content'),
+    default='',
+    help_text=_('The content of the client certificate file for mTLS authentication to the OPA server. Required when OPA_AUTH_TYPE is "Certificate".'),
+    category=('PolicyAsCode'),
+    category_slug='policyascode',
+    allow_blank=True,
+)
+
+register(
+    'OPA_AUTH_CLIENT_KEY',
+    field_class=fields.CharField,
+    label=_('OPA client key content'),
+    default='',
+    help_text=_('The content of the client key for mTLS authentication to the OPA server. Required when OPA_AUTH_TYPE is "Certificate".'),
+    category=('PolicyAsCode'),
+    category_slug='policyascode',
+    allow_blank=True,
+    encrypted=True,
+)
+
+register(
+    'OPA_AUTH_CA_CERT',
+    field_class=fields.CharField,
+    label=_('OPA CA certificate content'),
+    default='',
+    help_text=_('The content of the CA certificate for mTLS authentication to the OPA server. Required when OPA_AUTH_TYPE is "Certificate".'),
+    category=('PolicyAsCode'),
+    category_slug='policyascode',
+    allow_blank=True,
+)
+
+register(
+    'OPA_AUTH_CUSTOM_HEADERS',
+    field_class=fields.DictField,
+    label=_('OPA custom authentication headers'),
+    default={},
+    help_text=_('Optional custom headers included in requests to the OPA server. Defaults to empty dictionary ({}).'),
+    category=('PolicyAsCode'),
+    category_slug='policyascode',
+)
+
+register(
+    'OPA_REQUEST_TIMEOUT',
+    field_class=fields.FloatField,
+    label=_('OPA request timeout'),
+    default=1.5,
+    help_text=_('The number of seconds after which the connection to the OPA server will time out. Defaults to 1.5 seconds.'),
+    category=('PolicyAsCode'),
+    category_slug='policyascode',
+)
+
+register(
+    'OPA_REQUEST_RETRIES',
+    field_class=fields.IntegerField,
+    label=_('OPA request retry count'),
+    default=2,
+    help_text=_('The number of retry attempts for connecting to the OPA server. Default is 2.'),
+    category=('PolicyAsCode'),
+    category_slug='policyascode',
+)
+
+
+def policy_as_code_validate(serializer, attrs):
+    opa_host = attrs.get('OPA_HOST', '')
+    if opa_host and (opa_host.startswith('http://') or opa_host.startswith('https://')):
+        raise serializers.ValidationError({'OPA_HOST': _("OPA_HOST should not include 'http://' or 'https://' prefixes. Please enter only the hostname.")})
+    return attrs
+
+
+register_validate('policyascode', policy_as_code_validate)

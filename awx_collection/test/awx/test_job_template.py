@@ -2,9 +2,11 @@ from __future__ import absolute_import, division, print_function
 
 __metaclass__ = type
 
+import random
+
 import pytest
 
-from awx.main.models import ActivityStream, JobTemplate, Job, NotificationTemplate
+from awx.main.models import ActivityStream, JobTemplate, Job, NotificationTemplate, Label
 
 
 @pytest.mark.django_db
@@ -46,6 +48,12 @@ def test_resets_job_template_values(run_module, admin_user, project, inventory):
         'timeout': 50,
         'allow_simultaneous': True,
         'ask_limit_on_launch': True,
+        'ask_execution_environment_on_launch': True,
+        'ask_forks_on_launch': True,
+        'ask_instance_groups_on_launch': True,
+        'ask_job_slice_count_on_launch': True,
+        'ask_labels_on_launch': True,
+        'ask_timeout_on_launch': True,
     }
 
     result = run_module('job_template', module_args, admin_user)
@@ -55,6 +63,12 @@ def test_resets_job_template_values(run_module, admin_user, project, inventory):
     assert jt.timeout == 50
     assert jt.allow_simultaneous
     assert jt.ask_limit_on_launch
+    assert jt.ask_execution_environment_on_launch
+    assert jt.ask_forks_on_launch
+    assert jt.ask_instance_groups_on_launch
+    assert jt.ask_job_slice_count_on_launch
+    assert jt.ask_labels_on_launch
+    assert jt.ask_timeout_on_launch
 
     module_args = {
         'name': 'foo',
@@ -68,6 +82,12 @@ def test_resets_job_template_values(run_module, admin_user, project, inventory):
         'timeout': 0,
         'allow_simultaneous': False,
         'ask_limit_on_launch': False,
+        'ask_execution_environment_on_launch': False,
+        'ask_forks_on_launch': False,
+        'ask_instance_groups_on_launch': False,
+        'ask_job_slice_count_on_launch': False,
+        'ask_labels_on_launch': False,
+        'ask_timeout_on_launch': False,
     }
 
     result = run_module('job_template', module_args, admin_user)
@@ -78,6 +98,12 @@ def test_resets_job_template_values(run_module, admin_user, project, inventory):
     assert jt.timeout == 0
     assert not jt.allow_simultaneous
     assert not jt.ask_limit_on_launch
+    assert not jt.ask_execution_environment_on_launch
+    assert not jt.ask_forks_on_launch
+    assert not jt.ask_instance_groups_on_launch
+    assert not jt.ask_job_slice_count_on_launch
+    assert not jt.ask_labels_on_launch
+    assert not jt.ask_timeout_on_launch
 
 
 @pytest.mark.django_db
@@ -214,9 +240,45 @@ def test_job_template_with_survey_encrypted_default(run_module, admin_user, proj
 
     assert result.get('changed', False), result  # not actually desired, but assert for sanity
 
-    silence_warning.assert_called_once_with(
+    silence_warning.assert_any_call(
         "The field survey_spec of job_template {0} has encrypted data and " "may inaccurately report task is changed.".format(result['id'])
     )
+
+
+@pytest.mark.django_db
+def test_associate_changed_status(run_module, admin_user, organization, project):
+    # create JT and labels
+    jt = JobTemplate.objects.create(name='foo', project=project, playbook='helloworld.yml')
+    labels = [Label.objects.create(name=f'foo{i}', organization=organization) for i in range(10)]
+
+    # sanity: no-op without labels involved
+    result = run_module('job_template', dict(name=jt.name, playbook='helloworld.yml'), admin_user)
+    assert not result.get('failed', False), result.get('msg', result)
+    assert result['changed'] is False
+
+    # first time adding labels, this should make the label list equal to what was specified
+    result = run_module('job_template', dict(name=jt.name, playbook='helloworld.yml', labels=[l.name for l in labels]), admin_user)
+    assert not result.get('failed', False), result.get('msg', result)
+    assert result['changed']
+    assert set(l.id for l in jt.labels.all()) == set(l.id for l in labels)
+
+    # shuffling the labels should not result in any change
+    random.shuffle(labels)
+    result = run_module('job_template', dict(name=jt.name, playbook='helloworld.yml', labels=[l.name for l in labels]), admin_user)
+    assert not result.get('failed', False), result.get('msg', result)
+    assert result['changed'] is False
+
+    # not specifying labels should not change labels
+    result = run_module('job_template', dict(name=jt.name, playbook='helloworld.yml'), admin_user)
+    assert not result.get('failed', False), result.get('msg', result)
+    assert result['changed'] is False
+
+    # should be able to remove only some labels
+    fewer_labels = labels[:7]
+    result = run_module('job_template', dict(name=jt.name, playbook='helloworld.yml', labels=[l.name for l in fewer_labels]), admin_user)
+    assert not result.get('failed', False), result.get('msg', result)
+    assert result['changed']
+    assert set(l.id for l in jt.labels.all()) == set(l.id for l in fewer_labels)
 
 
 @pytest.mark.django_db

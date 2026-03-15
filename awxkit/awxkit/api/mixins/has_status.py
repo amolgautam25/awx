@@ -1,8 +1,9 @@
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 
 from awxkit.utils import poll_until
 from awxkit.exceptions import WaitUntilTimeout
+from awxkit.config import config
 
 
 def bytes_to_str(obj):
@@ -13,7 +14,6 @@ def bytes_to_str(obj):
 
 
 class HasStatus(object):
-
     completed_statuses = ['successful', 'failed', 'error', 'canceled']
     started_statuses = ['pending', 'running'] + completed_statuses
 
@@ -35,10 +35,10 @@ class HasStatus(object):
         return self
 
     def wait_until_completed(self, interval=5, timeout=60, **kwargs):
-        start_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc)
         HasStatus.wait_until_status(self, self.completed_statuses, interval=interval, timeout=timeout, **kwargs)
         if not getattr(self, 'event_processing_finished', True):
-            elapsed = datetime.utcnow() - start_time
+            elapsed = datetime.now(timezone.utc) - start_time
             time_left = timeout - elapsed.total_seconds()
             poll_until(lambda: getattr(self.get(), 'event_processing_finished', True), interval=interval, timeout=time_left, **kwargs)
         return self
@@ -84,7 +84,7 @@ class HasStatus(object):
         if getattr(self, 'job_explanation', '').startswith('Previous Task Failed'):
             try:
                 data = json.loads(self.job_explanation.replace('Previous Task Failed: ', ''))
-                dependency = self.walk('/api/v2/{0}s/{1}/'.format(data['job_type'], data['job_id']))
+                dependency = self.walk('/{0}v2/{1}s/{2}/'.format(config.api_base_path, data['job_type'], data['job_id']))
                 if hasattr(dependency, 'failure_output_details'):
                     msg += '\nDependency output:\n{}'.format(dependency.failure_output_details())
                 else:
@@ -92,7 +92,7 @@ class HasStatus(object):
             except Exception as e:
                 msg += '\nFailed to obtain dependency stdout: {}'.format(e)
 
-        msg += '\nTIME WHEN STATUS WAS FOUND: {} (UTC)\n'.format(datetime.utcnow())
+        msg += '\nTIME WHEN STATUS WAS FOUND: {} (UTC)\n'.format(datetime.now(timezone.utc))
 
         raise AssertionError(msg)
 

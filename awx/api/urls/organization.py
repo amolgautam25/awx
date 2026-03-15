@@ -3,7 +3,7 @@
 
 from django.urls import re_path
 
-from awx.api.views import (
+from awx.api.views.organization import (
     OrganizationList,
     OrganizationDetail,
     OrganizationUsersList,
@@ -14,7 +14,6 @@ from awx.api.views import (
     OrganizationJobTemplatesList,
     OrganizationWorkflowJobTemplatesList,
     OrganizationTeamsList,
-    OrganizationCredentialList,
     OrganizationActivityStreamList,
     OrganizationNotificationTemplatesList,
     OrganizationNotificationTemplatesErrorList,
@@ -25,9 +24,8 @@ from awx.api.views import (
     OrganizationGalaxyCredentialsList,
     OrganizationObjectRolesList,
     OrganizationAccessList,
-    OrganizationApplicationList,
 )
-
+from awx.api.views import OrganizationCredentialList
 
 urls = [
     re_path(r'^$', OrganizationList.as_view(), name='organization_list'),
@@ -67,7 +65,6 @@ urls = [
     re_path(r'^(?P<pk>[0-9]+)/galaxy_credentials/$', OrganizationGalaxyCredentialsList.as_view(), name='organization_galaxy_credentials_list'),
     re_path(r'^(?P<pk>[0-9]+)/object_roles/$', OrganizationObjectRolesList.as_view(), name='organization_object_roles_list'),
     re_path(r'^(?P<pk>[0-9]+)/access_list/$', OrganizationAccessList.as_view(), name='organization_access_list'),
-    re_path(r'^(?P<pk>[0-9]+)/applications/$', OrganizationApplicationList.as_view(), name='organization_applications_list'),
 ]
 
 __all__ = ['urls']

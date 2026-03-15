@@ -5,12 +5,10 @@ from awxkit.api.resources import resources
 from . import base
 from . import page
 
-
 log = logging.getLogger(__name__)
 
 
 class Role(base.Base):
-
     NATURAL_KEY = ('name',)
 
     def get_natural_key(self, cache=None):
@@ -33,7 +31,6 @@ page.register_page(resources.role, Role)
 
 
 class Roles(page.PageList, Role):
-
     pass
 
 

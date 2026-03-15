@@ -5,6 +5,7 @@ from copy import deepcopy
 import datetime
 import logging
 import json
+import traceback
 
 from django.db import models
 from django.conf import settings
@@ -15,10 +16,11 @@ from django.utils.encoding import smart_str, force_str
 from jinja2 import sandbox, ChainableUndefined
 from jinja2.exceptions import TemplateSyntaxError, UndefinedError, SecurityError
 
+from ansible_base.lib.utils.models import prevent_search
+
 # AWX
 from awx.api.versioning import reverse
-from awx.main.fields import JSONBlob
-from awx.main.models.base import CommonModelNameNotUnique, CreatedModifiedModel, prevent_search
+from awx.main.models.base import CommonModelNameNotUnique, CreatedModifiedModel
 from awx.main.utils import encrypt_field, decrypt_field, set_environ
 from awx.main.notifications.email_backend import CustomEmailBackend
 from awx.main.notifications.slack_backend import SlackBackend
@@ -29,7 +31,7 @@ from awx.main.notifications.mattermost_backend import MattermostBackend
 from awx.main.notifications.grafana_backend import GrafanaBackend
 from awx.main.notifications.rocketchat_backend import RocketChatBackend
 from awx.main.notifications.irc_backend import IrcBackend
-
+from awx.main.notifications.awssns_backend import AWSSNSBackend
 
 logger = logging.getLogger('awx.main.models.notifications')
 
@@ -37,8 +39,8 @@ __all__ = ['NotificationTemplate', 'Notification']
 
 
 class NotificationTemplate(CommonModelNameNotUnique):
-
     NOTIFICATION_TYPES = [
+        ('awssns', _('AWS SNS'), AWSSNSBackend),
         ('email', _('Email'), CustomEmailBackend),
         ('slack', _('Slack'), SlackBackend),
         ('twilio', _('Twilio'), TwilioBackend),
@@ -70,12 +72,12 @@ class NotificationTemplate(CommonModelNameNotUnique):
         choices=NOTIFICATION_TYPE_CHOICES,
     )
 
-    notification_configuration = prevent_search(JSONBlob(default=dict))
+    notification_configuration = prevent_search(models.JSONField(default=dict))
 
     def default_messages():
         return {'started': None, 'success': None, 'error': None, 'workflow_approval': None}
 
-    messages = JSONBlob(null=True, blank=True, default=default_messages, help_text=_('Optional custom messages for notification template.'))
+    messages = models.JSONField(null=True, blank=True, default=default_messages, help_text=_('Optional custom messages for notification template.'))
 
     def has_message(self, condition):
         potential_template = self.messages.get(condition, {})
@@ -237,7 +239,7 @@ class Notification(CreatedModifiedModel):
         default='',
         editable=False,
     )
-    body = JSONBlob(default=dict, blank=True)
+    body = models.JSONField(default=dict, blank=True)
 
     def get_absolute_url(self, request=None):
         return reverse('api:notification_detail', kwargs={'pk': self.pk}, request=request)
@@ -285,7 +287,7 @@ class JobNotificationMixin(object):
         'workflow_url',
         'scm_branch',
         'artifacts',
-        {'host_status_counts': ['skipped', 'ok', 'changed', 'failed', 'failures', 'dark' 'processed', 'rescued', 'ignored']},
+        {'host_status_counts': ['skipped', 'ok', 'changed', 'failed', 'failures', 'dark', 'processed', 'rescued', 'ignored']},
         {
             'summary_fields': [
                 {
@@ -393,11 +395,11 @@ class JobNotificationMixin(object):
                 'verbosity': 0,
             },
             'job_friendly_name': 'Job',
-            'url': 'https://towerhost/#/jobs/playbook/1010',
+            'url': 'https://platformhost/#/jobs/playbook/1010',
             'approval_status': 'approved',
             'approval_node_name': 'Approve Me',
-            'workflow_url': 'https://towerhost/#/jobs/workflow/1010',
-            'job_metadata': """{'url': 'https://towerhost/$/jobs/playbook/13',
+            'workflow_url': 'https://platformhost/#/jobs/workflow/1010',
+            'job_metadata': """{'url': 'https://platformhost/$/jobs/playbook/13',
  'traceback': '',
  'status': 'running',
  'started': '2019-08-07T21:46:38.362630+00:00',
@@ -408,6 +410,7 @@ class JobNotificationMixin(object):
  'inventory': 'Stub Inventory',
  'id': 42,
  'hosts': {},
+ 'extra_vars': {},
  'friendly_name': 'Job',
  'finished': False,
  'credential': 'Stub credential',
@@ -421,21 +424,8 @@ class JobNotificationMixin(object):
         The context will contain allowed content retrieved from a serialized job object
         (see JobNotificationMixin.JOB_FIELDS_ALLOWED_LIST the job's friendly name,
         and a url to the job run."""
-        job_context = {'host_status_counts': {}}
-        summary = None
-        try:
-            has_event_property = any([f for f in self.event_class._meta.fields if f.name == 'event'])
-        except NotImplementedError:
-            has_event_property = False
-        if has_event_property:
-            qs = self.get_event_queryset()
-            if qs:
-                event = qs.only('event_data').filter(event='playbook_on_stats').first()
-                if event:
-                    summary = event.get_host_status_counts()
-        job_context['host_status_counts'] = summary
         context = {
-            'job': job_context,
+            'job': {'host_status_counts': self.host_status_counts},
             'job_friendly_name': self.get_notification_friendly_name(),
             'url': self.get_ui_url(),
             'job_metadata': json.dumps(self.notification_data(), ensure_ascii=False, indent=4),
@@ -496,14 +486,29 @@ class JobNotificationMixin(object):
         if msg_template:
             try:
                 msg = env.from_string(msg_template).render(**context)
-            except (TemplateSyntaxError, UndefinedError, SecurityError):
-                msg = ''
+            except (TemplateSyntaxError, UndefinedError, SecurityError) as e:
+                msg = '\r\n'.join([e.message, ''.join(traceback.format_exception(None, e, e.__traceback__).replace('\n', '\r\n'))])
 
         if body_template:
             try:
                 body = env.from_string(body_template).render(**context)
-            except (TemplateSyntaxError, UndefinedError, SecurityError):
-                body = ''
+            except (TemplateSyntaxError, UndefinedError, SecurityError) as e:
+                body = '\r\n'.join([e.message, ''.join(traceback.format_exception(None, e, e.__traceback__).replace('\n', '\r\n'))])
+
+        # https://datatracker.ietf.org/doc/html/rfc2822#section-2.2
+        # Body should have at least 2 CRLF, some clients will interpret
+        # the email incorrectly with blank body.  So we will check that
+
+        if len(body.strip().splitlines()) < 1:
+            # blank body
+            body = '\r\n'.join(
+                [
+                    "The template rendering return a blank body.",
+                    "Please check the template.",
+                    "Refer to https://github.com/ansible/awx/issues/13983",
+                    "for further information.",
+                ]
+            )
 
         return (msg, body)
 
@@ -522,7 +527,7 @@ class JobNotificationMixin(object):
             return
 
         for nt in set(notification_templates.get(self.STATUS_TO_TEMPLATE_TYPE[status], [])):
-            (msg, body) = self.build_notification_message(nt, status)
+            msg, body = self.build_notification_message(nt, status)
 
             # Use kwargs to force late-binding
             # https://stackoverflow.com/a/3431699/10669572

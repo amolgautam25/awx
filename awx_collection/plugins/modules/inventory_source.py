@@ -36,13 +36,14 @@ options:
       type: str
     inventory:
       description:
-        - Inventory the group should be made a member of.
+        - Inventory name, ID, or named URL the group should be made a member of.
       required: True
       type: str
     source:
       description:
         - The source to use for this group.
-      choices: [ "scm", "ec2", "gce", "azure_rm", "vmware", "satellite6", "openstack", "rhv", "controller", "insights" ]
+      choices: [ "scm", "ec2", "gce", "azure_rm", "vmware", "satellite6", "openstack", "rhv", "controller", "insights", "terraform",
+                 "openshift_virtualization" ]
       type: str
     source_path:
       description:
@@ -64,13 +65,17 @@ options:
       description:
         - If specified, AWX will only import hosts that match this regular expression.
       type: str
+    limit:
+      description:
+        - Enter host, group or pattern match
+      type: str
     credential:
       description:
-        - Credential to use for the source.
+        - Credential name, ID, or named URL to use for the source.
       type: str
     execution_environment:
       description:
-        - Execution Environment to use for the source.
+        - Execution Environment name, ID, or named URL to use for the source.
       type: str
     custom_virtualenv:
       description:
@@ -103,16 +108,18 @@ options:
       type: int
     source_project:
       description:
-        - Project to use as source with scm option
+        - Project name, ID, or named URL to use as source with scm option
       type: str
-    update_on_project_update:
-      description: Update this source when the related project updates if source is C(scm)
-      type: bool
+    scm_branch:
+      description:
+        - Inventory source SCM branch.
+        - Project must have branch override enabled.
+      type: str
     state:
       description:
         - Desired state of the resource.
       default: "present"
-      choices: ["present", "absent"]
+      choices: ["present", "absent", "exists"]
       type: str
     notification_templates_started:
       description:
@@ -143,8 +150,8 @@ EXAMPLES = '''
     description: Source for inventory
     inventory: previously-created-inventory
     credential: previously-created-credential
-    overwrite: True
-    update_on_launch: True
+    overwrite: true
+    update_on_launch: true
     organization: Default
     source_vars:
       private: false
@@ -164,12 +171,28 @@ def main():
         #
         # How do we handle manual and file? The controller does not seem to be able to activate them
         #
-        source=dict(choices=["scm", "ec2", "gce", "azure_rm", "vmware", "satellite6", "openstack", "rhv", "controller", "insights"]),
+        source=dict(
+            choices=[
+                "scm",
+                "ec2",
+                "gce",
+                "azure_rm",
+                "vmware",
+                "satellite6",
+                "openstack",
+                "rhv",
+                "controller",
+                "insights",
+                "terraform",
+                "openshift_virtualization",
+            ]
+        ),
         source_path=dict(),
         source_vars=dict(type='dict'),
         enabled_var=dict(),
         enabled_value=dict(),
         host_filter=dict(),
+        limit=dict(),
         credential=dict(),
         execution_environment=dict(),
         custom_virtualenv=dict(),
@@ -181,11 +204,11 @@ def main():
         update_on_launch=dict(type='bool'),
         update_cache_timeout=dict(type='int'),
         source_project=dict(),
-        update_on_project_update=dict(type='bool'),
+        scm_branch=dict(type='str'),
         notification_templates_started=dict(type="list", elements='str'),
         notification_templates_success=dict(type="list", elements='str'),
         notification_templates_error=dict(type="list", elements='str'),
-        state=dict(choices=['present', 'absent'], default='present'),
+        state=dict(choices=['present', 'absent', 'exists'], default='present'),
     )
 
     # Create a module for ourselves
@@ -207,11 +230,16 @@ def main():
     inventory_object = module.get_one('inventories', name_or_id=inventory, data=lookup_data)
 
     if not inventory_object:
-        module.fail_json(msg='The specified inventory, {0}, was not found.'.format(lookup_data))
+        # if the inventory does not exist, then it can't have sources.
+        if state == 'absent':
+            module.exit_json(**module.json_output)
+        else:
+            module.fail_json(msg='The specified inventory, {0}, was not found.'.format(lookup_data))
 
     inventory_source_object = module.get_one(
         'inventory_sources',
         name_or_id=name,
+        check_exists=(state == 'exists'),
         **{
             'data': {
                 'inventory': inventory_object['id'],
@@ -273,10 +301,11 @@ def main():
         'verbosity',
         'update_on_launch',
         'update_cache_timeout',
-        'update_on_project_update',
         'enabled_var',
         'enabled_value',
         'host_filter',
+        'scm_branch',
+        'limit',
     )
 
     # Layer in all remaining optional information

@@ -3,12 +3,10 @@
 import pytest
 from unittest import mock
 
-from django.core.exceptions import ValidationError
-
 # AWX
 from awx.main.models import Host, Inventory, InventorySource, InventoryUpdate, CredentialType, Credential, Job
-from awx.main.constants import CLOUD_PROVIDERS
 from awx.main.utils.filters import SmartFilter
+from awx.main.utils.plugins import discover_available_cloud_provider_plugin_names
 
 
 @pytest.mark.django_db
@@ -123,19 +121,6 @@ class TestActiveCount:
 
 @pytest.mark.django_db
 class TestSCMUpdateFeatures:
-    def test_automatic_project_update_on_create(self, inventory, project):
-        inv_src = InventorySource(source_project=project, source_path='inventory_file', inventory=inventory, update_on_project_update=True, source='scm')
-        with mock.patch.object(inv_src, 'update') as mck_update:
-            inv_src.save()
-            mck_update.assert_called_once_with()
-
-    def test_reset_scm_revision(self, scm_inventory_source):
-        starting_rev = scm_inventory_source.scm_last_revision
-        assert starting_rev != ''
-        scm_inventory_source.source_path = '/newfolder/newfile.ini'
-        scm_inventory_source.save()
-        assert scm_inventory_source.scm_last_revision == ''
-
     def test_source_location(self, scm_inventory_source):
         # Combines project directory with the inventory file specified
         inventory_update = InventoryUpdate(inventory_source=scm_inventory_source, source_path=scm_inventory_source.source_path)
@@ -168,22 +153,6 @@ class TestRelatedJobs:
 
 
 @pytest.mark.django_db
-class TestSCMClean:
-    def test_clean_update_on_project_update_multiple(self, inventory):
-        inv_src1 = InventorySource(inventory=inventory, update_on_project_update=True, source='scm')
-        inv_src1.clean_update_on_project_update()
-        inv_src1.save()
-
-        inv_src1.source_vars = '---\nhello: world'
-        inv_src1.clean_update_on_project_update()
-
-        inv_src2 = InventorySource(inventory=inventory, update_on_project_update=True, source='scm')
-
-        with pytest.raises(ValidationError):
-            inv_src2.clean_update_on_project_update()
-
-
-@pytest.mark.django_db
 class TestInventorySourceInjectors:
     def test_extra_credentials(self, project, credential):
         inventory_source = InventorySource.objects.create(name='foo', source='scm', source_project=project)
@@ -197,10 +166,11 @@ class TestInventorySourceInjectors:
 
     def test_all_cloud_sources_covered(self):
         """Code in several places relies on the fact that the older
-        CLOUD_PROVIDERS constant contains the same names as what are
+        discover_cloud_provider_plugin_names returns the same names as what are
         defined within the injectors
         """
-        assert set(CLOUD_PROVIDERS) == set(InventorySource.injectors.keys())
+        # slight exception case for constructed, because it has a FQCN but is not a cloud source
+        assert set(discover_available_cloud_provider_plugin_names()) | set(['constructed']) == set(InventorySource.injectors.keys())
 
     @pytest.mark.parametrize('source,filename', [('ec2', 'aws_ec2.yml'), ('openstack', 'openstack.yml'), ('gce', 'gcp_compute.yml')])
     def test_plugin_filenames(self, source, filename):
@@ -223,6 +193,7 @@ class TestInventorySourceInjectors:
             ('satellite6', 'theforeman.foreman.foreman'),
             ('insights', 'redhatinsights.insights.insights'),
             ('controller', 'awx.awx.tower'),
+            ('terraform', 'cloud.terraform.terraform_state'),
         ],
     )
     def test_plugin_proper_names(self, source, proper_name):
@@ -261,7 +232,6 @@ def setup_ec2_gce(organization):
 
 @pytest.fixture
 def setup_inventory_groups(inventory, group_factory):
-
     groupA = group_factory('test_groupA')
     groupB = group_factory('test_groupB')
 
@@ -302,6 +272,7 @@ def test_inventory_update_excessively_long_name(inventory, inventory_source):
 class TestHostManager:
     def test_host_filter_not_smart(self, setup_ec2_gce, organization):
         smart_inventory = Inventory(name='smart', organization=organization, host_filter='inventory_sources__source=ec2')
+        smart_inventory.save()
         assert len(smart_inventory.hosts.all()) == 0
 
     def test_host_distinctness(self, setup_inventory_groups, organization):

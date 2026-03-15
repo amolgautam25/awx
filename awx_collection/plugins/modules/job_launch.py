@@ -34,17 +34,17 @@ options:
       type: str
     inventory:
       description:
-        - Inventory to use for the job, only used if prompt for inventory is set.
+        - Inventory name, ID, or named URL to use for the job, only used if prompt for inventory is set.
       type: str
     organization:
       description:
-        - Organization the job template exists in.
+        - Organization name, ID, or named URL the job template exists in.
         - Used to help lookup the object, cannot be modified using this module.
         - If not provided, will lookup by name only, which does not work with duplicates.
       type: str
     credentials:
       description:
-        - Credential to use for job, only used if prompt for credential is set.
+        - Credential names, IDs, or named URLs to use for job, only used if prompt for credential is set.
       type: list
       aliases: ['credential']
       elements: str
@@ -86,6 +86,33 @@ options:
       description:
         - Passwords for credentials which are set to prompt on launch
       type: dict
+    execution_environment:
+      description:
+        - Execution environment name, ID, or named URL to use for the job, only used if prompt for execution environment is set.
+      type: str
+    forks:
+      description:
+        - Forks to use for the job, only used if prompt for forks is set.
+      type: int
+    instance_groups:
+      description:
+        - Instance group names, IDs, or named URLs to use for the job, only used if prompt for instance groups is set.
+      type: list
+      elements: str
+    job_slice_count:
+      description:
+        - Job slice count to use for the job, only used if prompt for job slice count is set.
+      type: int
+    labels:
+      description:
+        - Labels to use for the job, only used if prompt for labels is set.
+      type: list
+      elements: str
+    job_timeout:
+      description:
+        - Timeout to use for the job, only used if prompt for timeout is set.
+        - This parameter is sent through the API to the job.
+      type: int
     wait:
       description:
         - Wait for the job to complete.
@@ -95,12 +122,12 @@ options:
       description:
         - The interval to request an update from the controller.
       required: False
-      default: 1
+      default: 2
       type: float
     timeout:
       description:
         - If waiting for the job to complete this will abort after this
-          amount of seconds
+          amount of seconds. This happens on the module side.
       type: int
 extends_documentation_fragment: awx.awx.auth
 '''
@@ -124,7 +151,9 @@ EXAMPLES = '''
   job_launch:
     job_template: "My Job Template"
     inventory: "My Inventory"
-    credential: "My Credential"
+    credentials:
+      - "My Credential"
+      - "suplementary cred"
   register: job
 - name: Wait for job max 120s
   job_wait:
@@ -153,10 +182,10 @@ def main():
     argument_spec = dict(
         name=dict(required=True, aliases=['job_template']),
         job_type=dict(choices=['run', 'check']),
-        inventory=dict(default=None),
+        inventory=dict(),
         organization=dict(),
         # Credentials will be a str instead of a list for backwards compatability
-        credentials=dict(type='list', default=None, aliases=['credential'], elements='str'),
+        credentials=dict(type='list', aliases=['credential'], elements='str'),
         limit=dict(),
         tags=dict(type='list', elements='str'),
         extra_vars=dict(type='dict'),
@@ -165,9 +194,15 @@ def main():
         verbosity=dict(type='int', choices=[0, 1, 2, 3, 4, 5]),
         diff_mode=dict(type='bool'),
         credential_passwords=dict(type='dict', no_log=False),
+        execution_environment=dict(),
+        forks=dict(type='int'),
+        instance_groups=dict(type='list', elements='str'),
+        job_slice_count=dict(type='int'),
+        labels=dict(type='list', elements='str'),
+        job_timeout=dict(type='int'),
         wait=dict(default=False, type='bool'),
-        interval=dict(default=1.0, type='float'),
-        timeout=dict(default=None, type='int'),
+        interval=dict(default=2.0, type='float'),
+        timeout=dict(type='int'),
     )
 
     # Create a module for ourselves
@@ -179,6 +214,9 @@ def main():
     inventory = module.params.get('inventory')
     organization = module.params.get('organization')
     credentials = module.params.get('credentials')
+    execution_environment = module.params.get('execution_environment')
+    instance_groups = module.params.get('instance_groups')
+    labels = module.params.get('labels')
     wait = module.params.get('wait')
     interval = module.params.get('interval')
     timeout = module.params.get('timeout')
@@ -191,6 +229,9 @@ def main():
         'verbosity',
         'diff_mode',
         'credential_passwords',
+        'forks',
+        'job_slice_count',
+        'job_timeout',
     ):
         field_val = module.params.get(field_name)
         if field_val is not None:
@@ -204,6 +245,11 @@ def main():
         if skip_tags is not None:
             optional_args['skip_tags'] = ",".join(skip_tags)
 
+    # job_timeout is special because its actually timeout but we already had a timeout variable
+    job_timeout = module.params.get('job_timeout')
+    if job_timeout is not None:
+        optional_args['timeout'] = job_timeout
+
     # Create a datastructure to pass into our job launch
     post_data = {}
     for arg_name, arg_value in optional_args.items():
@@ -213,11 +259,21 @@ def main():
     # Attempt to look up the related items the user specified (these will fail the module if not found)
     if inventory:
         post_data['inventory'] = module.resolve_name_to_id('inventories', inventory)
+    if execution_environment:
+        post_data['execution_environment'] = module.resolve_name_to_id('execution_environments', execution_environment)
 
     if credentials:
         post_data['credentials'] = []
         for credential in credentials:
             post_data['credentials'].append(module.resolve_name_to_id('credentials', credential))
+    if labels:
+        post_data['labels'] = []
+        for label in labels:
+            post_data['labels'].append(module.resolve_name_to_id('labels', label))
+    if instance_groups:
+        post_data['instance_groups'] = []
+        for instance_group in instance_groups:
+            post_data['instance_groups'].append(module.resolve_name_to_id('instance_groups', instance_group))
 
     # Attempt to look up job_template based on the provided name
     lookup_data = {}

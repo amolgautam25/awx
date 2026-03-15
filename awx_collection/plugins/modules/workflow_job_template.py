@@ -19,8 +19,7 @@ author: "John Westcott IV (@john-westcott-iv)"
 short_description: create, update, or destroy Automation Platform Controller workflow job templates.
 description:
     - Create, update, or destroy Automation Platform Controller workflow job templates.
-    - Replaces the deprecated tower_workflow_template module.
-    - Use workflow_job_template_node after this, or use the schema parameter to build the workflow's graph
+    - Use workflow_job_template_node after this, or use the workflow_nodes parameter to build the workflow's graph
 options:
     name:
       description:
@@ -47,9 +46,19 @@ options:
       description:
         - Variables which will be made available to jobs ran inside the workflow.
       type: dict
+    job_tags:
+      description:
+        - Comma separated list of the tags to use for the job template.
+      type: str
+    ask_tags_on_launch:
+      description:
+        - Prompt user for job tags on launch.
+      type: bool
+      aliases:
+        - ask_tags
     organization:
       description:
-        - Organization the workflow job template exists in.
+        - Organization name, ID, or named URL the workflow job template exists in.
         - Used to help lookup the object, cannot be modified using this module.
         - If not provided, will lookup by name only, which does not work with duplicates.
       type: str
@@ -63,7 +72,7 @@ options:
       type: bool
     inventory:
       description:
-        - Inventory applied as a prompt, assuming job template prompts for inventory
+        - Name, ID, or named URL of inventory applied as a prompt, assuming job template prompts for inventory
       type: str
     limit:
       description:
@@ -85,6 +94,22 @@ options:
       description:
         - Prompt user for limit on launch of this workflow job template
       type: bool
+    ask_labels_on_launch:
+      description:
+        - Prompt user for labels on launch.
+      type: bool
+      aliases:
+        - ask_labels
+    ask_skip_tags_on_launch:
+      description:
+        - Prompt user for job tags to skip on launch.
+      type: bool
+      aliases:
+        - ask_skip_tags
+    skip_tags:
+      description:
+        - Comma separated list of the tags to skip for the job template.
+      type: str
     webhook_service:
       description:
         - Service that webhook requests will be accepted from
@@ -119,6 +144,7 @@ options:
       choices:
         - present
         - absent
+        - exists
       default: "present"
       type: str
     notification_templates_started:
@@ -138,14 +164,16 @@ options:
       elements: str
     notification_templates_approvals:
       description:
-        - list of notifications to send on start
+        - list of notifications to send on approval
       type: list
       elements: str
-    schema:
+    workflow_nodes:
       description:
         - A json list of nodes and their coresponding options. The following suboptions describe a single node.
       type: list
       elements: dict
+      aliases:
+        - schema
       suboptions:
         extra_data:
           description:
@@ -156,7 +184,21 @@ options:
         inventory:
           description:
             - Inventory applied as a prompt, if job template prompts for inventory
-          type: str
+          type: dict
+          suboptions:
+            name:
+              description:
+                - Name Inventory to be applied to job as launch-time prompts.
+              type: str
+            organization:
+              description:
+                - Name of key for use in model for organizational reference
+              type: dict
+              suboptions:
+                name:
+                  description:
+                    - The organization of the credentials exists in.
+                  type: str
         scm_branch:
           description:
             - SCM branch applied as a prompt, if job template prompts for SCM branch
@@ -180,6 +222,30 @@ options:
           description:
             - Limit to act on, applied as a prompt, if job template prompts for limit
           type: str
+        forks:
+          description:
+            - The number of parallel or simultaneous processes to use while executing the playbook, if job template prompts for forks
+          type: int
+        job_slice_count:
+          description:
+            - The number of jobs to slice into at runtime, if job template prompts for job slices.
+            - Will cause the Job Template to launch a workflow if value is greater than 1.
+          type: int
+          default: '1'
+        timeout:
+          description:
+            - Maximum time in seconds to wait for a job to finish (server-side), if job template prompts for timeout.
+          type: int
+        execution_environment:
+          description:
+            - Name of Execution Environment to be applied to job as launch-time prompts.
+          type: dict
+          suboptions:
+            name:
+              description:
+                - Name of Execution Environment to be applied to job as launch-time prompts.
+                - Uniqueness is not handled rigorously.
+              type: str
         diff_mode:
           description:
             - Run diff mode, applied as a prompt, if job template prompts for diff mode
@@ -259,7 +325,7 @@ options:
             type:
               description:
                 - Name of unified job template type to run in the workflow.
-                - Can be a job_template, project, inventory_source, workflow_approval.
+                - Can be a job_template, project, inventory_source, system_job_template, workflow_approval, workflow_job_template.
               type: str
             timeout:
               description:
@@ -270,7 +336,6 @@ options:
         related:
           description:
             - Related items to this workflow node.
-            - Must include credentials, failure_nodes, always_nodes, success_nodes, even if empty.
           type: dict
           suboptions:
             always_nodes:
@@ -278,48 +343,96 @@ options:
                 - Nodes that will run after this node completes.
                 - List of node identifiers.
               type: list
+              elements: dict
               suboptions:
                 identifier:
                   description:
                     - Identifier of Node that will run after this node completes given this option.
-                  elements: str
+                  type: str
             success_nodes:
               description:
                 - Nodes that will run after this node on success.
                 - List of node identifiers.
               type: list
+              elements: dict
               suboptions:
                 identifier:
                   description:
                     - Identifier of Node that will run after this node completes given this option.
-                  elements: str
+                  type: str
             failure_nodes:
               description:
                 - Nodes that will run after this node on failure.
                 - List of node identifiers.
               type: list
+              elements: dict
               suboptions:
                 identifier:
                   description:
                     - Identifier of Node that will run after this node completes given this option.
-                  elements: str
+                  type: str
             credentials:
               description:
                 - Credentials to be applied to job as launch-time prompts.
                 - List of credential names.
                 - Uniqueness is not handled rigorously.
               type: list
+              elements: dict
               suboptions:
                 name:
                   description:
                     - Name Credentials to be applied to job as launch-time prompts.
-                  elements: str
-    destroy_current_schema:
+                  type: str
+                organization:
+                  description:
+                    - Name of key for use in model for organizational reference
+                  type: dict
+                  suboptions:
+                    name:
+                      description:
+                        - The organization of the credentials exists in.
+                      type: str
+            labels:
+              description:
+                - Labels to be applied to job as launch-time prompts.
+                - List of Label names.
+                - Uniqueness is not handled rigorously.
+              type: list
+              elements: dict
+              suboptions:
+                name:
+                  description:
+                    - Name Labels to be applied to job as launch-time prompts.
+                  type: str
+                organization:
+                  description:
+                    - Name of key for use in model for organizational reference
+                  type: dict
+                  suboptions:
+                    name:
+                      description:
+                        - The organization of the label node exists in.
+                      type: str
+            instance_groups:
+              description:
+                - Instance groups to be applied to job as launch-time prompts.
+                - List of Instance group names.
+                - Uniqueness is not handled rigorously.
+              type: list
+              elements: dict
+              suboptions:
+                name:
+                  description:
+                    - Name of Instance groups to be applied to job as launch-time prompts.
+                  type: str
+    destroy_current_nodes:
       description:
-        - Set in order to destroy current schema on the workflow.
-        - This option is used for full schema update, if not used, nodes not described in schema will persist and keep current associations and links.
+        - Set in order to destroy current workflow_nodes on the workflow.
+        - This option is used for full workflow update, if not used, nodes not described in workflow will persist and keep current associations and links.
       type: bool
       default: False
+      aliases:
+        - destroy_current_schema
 
 extends_documentation_fragment: awx.awx.auth
 '''
@@ -331,12 +444,12 @@ EXAMPLES = '''
     description: created by Ansible Playbook
     organization: Default
 
-- name: Create a workflow job template with schema in template
+- name: Create a workflow job template with workflow nodes in template
   awx.awx.workflow_job_template:
     name: example-workflow
     inventory: Demo Inventory
     extra_vars: {'foo': 'bar', 'another-foo': {'barz': 'bar2'}}
-    schema:
+    workflow_nodes:
       - identifier: node101
         unified_job_template:
           name: example-project
@@ -349,7 +462,9 @@ EXAMPLES = '''
           failure_nodes:
             - identifier: node201
           always_nodes: []
-          credentials: []
+          credentials:
+            - local_cred
+            - suplementary cred
       - identifier: node201
         unified_job_template:
           organization:
@@ -394,63 +509,71 @@ EXAMPLES = '''
     copy_from: example-workflow
     organization: Foo
 
-- name: Create a workflow job template with schema in template
+- name: Create a workflow job template with workflow nodes in template
   awx.awx.workflow_job_template:
     name: example-workflow
     inventory: Demo Inventory
     extra_vars: {'foo': 'bar', 'another-foo': {'barz': 'bar2'}}
-    schema:
+    workflow_nodes:
       - identifier: node101
         unified_job_template:
-          name: example-project
+          name: example-inventory
           inventory:
             organization:
               name: Default
           type: inventory_source
         related:
-          success_nodes: []
           failure_nodes:
             - identifier: node201
-          always_nodes: []
-          credentials: []
-      - identifier: node201
-        unified_job_template:
-          organization:
-            name: Default
-          name: job template 1
-          type: job_template
-        credentials: []
-        related:
-          success_nodes:
-            - identifier: node301
-          failure_nodes: []
-          always_nodes: []
-          credentials: []
-      - identifier: node202
+      - identifier: node102
         unified_job_template:
           organization:
             name: Default
           name: example-project
           type: project
         related:
-          success_nodes: []
-          failure_nodes: []
-          always_nodes: []
-          credentials: []
-      - identifier: node301
-        all_parents_must_converge: false
+          success_nodes:
+            - identifier: node201
+      - identifier: node201
         unified_job_template:
           organization:
             name: Default
-          name: job template 2
+          name: example-job template
           type: job_template
+        inventory:
+          name: Demo Inventory
+          organization:
+            name: Default
         related:
-          success_nodes: []
-          failure_nodes: []
+          success_nodes:
+            - identifier: node401
+          failure_nodes:
+            - identifier: node301
           always_nodes: []
-          credentials: []
-  register: result
-
+          credentials:
+            - name: cyberark
+              organization:
+                name: Default
+          instance_groups:
+            - name: SunCavanaugh Cloud
+          labels:
+            - name: Custom Label
+              organization:
+                name: Default
+      - all_parents_must_converge: false
+        identifier: node301
+        unified_job_template:
+          description: Approval node for example
+          timeout: 900
+          type: workflow_approval
+          name: Approval Node for Demo
+        related:
+          success_nodes:
+            - identifier: node401
+      - identifier: node401
+        unified_job_template:
+          name: Cleanup Activity Stream
+          type: system_job_template
 '''
 
 from ..module_utils.controller_api import ControllerAPIModule
@@ -475,8 +598,8 @@ def update_survey(module, last_request):
             module.fail_json(msg="Failed to update survey: {0}".format(response['json']['error']))
 
 
-def create_schema_nodes(module, response, schema, workflow_id):
-    for workflow_node in schema:
+def create_workflow_nodes(module, response, workflow_nodes, workflow_id):
+    for workflow_node in workflow_nodes:
         workflow_node_fields = {}
         search_fields = {}
         association_fields = {}
@@ -484,15 +607,20 @@ def create_schema_nodes(module, response, schema, workflow_id):
         # Lookup Job Template ID
         if workflow_node['unified_job_template']['name']:
             if workflow_node['unified_job_template']['type'] is None:
-                module.fail_json(msg='Could not find unified job template type in schema {1}'.format(workflow_node))
+                module.fail_json(msg='Could not find unified job template type in workflow_nodes {0}'.format(workflow_node))
+            search_fields['type'] = workflow_node['unified_job_template']['type']
             if workflow_node['unified_job_template']['type'] == 'inventory_source':
-                organization_id = module.resolve_name_to_id('organizations', workflow_node['unified_job_template']['inventory']['organization']['name'])
-                search_fields['organization'] = organization_id
-            elif workflow_node['unified_job_template']['type'] == 'workflow_approval':
-                pass
-            else:
+                if 'inventory' in workflow_node['unified_job_template']:
+                    if 'organization' in workflow_node['unified_job_template']['inventory']:
+                        organization_id = module.resolve_name_to_id('organizations', workflow_node['unified_job_template']['inventory']['organization']['name'])
+                        search_fields['organization'] = organization_id
+                    else:
+                        pass
+            elif 'organization' in workflow_node['unified_job_template']:
                 organization_id = module.resolve_name_to_id('organizations', workflow_node['unified_job_template']['organization']['name'])
                 search_fields['organization'] = organization_id
+            else:
+                pass
             unified_job_template = module.get_one('unified_job_templates', name_or_id=workflow_node['unified_job_template']['name'], **{'data': search_fields})
             if unified_job_template:
                 workflow_node_fields['unified_job_template'] = unified_job_template['id']
@@ -512,6 +640,9 @@ def create_schema_nodes(module, response, schema, workflow_id):
             'limit',
             'diff_mode',
             'verbosity',
+            'forks',
+            'job_slice_count',
+            'timeout',
             'all_parents_must_converge',
             'state',
         ):
@@ -520,6 +651,20 @@ def create_schema_nodes(module, response, schema, workflow_id):
                 workflow_node_fields[field_name] = field_val
             if workflow_node['identifier']:
                 search_fields = {'identifier': workflow_node['identifier']}
+            if 'execution_environment' in workflow_node:
+                workflow_node_fields['execution_environment'] = module.get_one(
+                    'execution_environments', name_or_id=workflow_node['execution_environment']['name']
+                )['id']
+
+        # Two lookup methods are used based on a fix added in 21.11.0, and the awx export model
+        if 'inventory' in workflow_node:
+            if 'name' in workflow_node['inventory']:
+                inv_lookup_data = {}
+                if 'organization' in workflow_node['inventory']:
+                    inv_lookup_data['organization'] = module.resolve_name_to_id('organizations', workflow_node['inventory']['organization']['name'])
+                workflow_node_fields['inventory'] = module.get_one('inventories', name_or_id=workflow_node['inventory']['name'], data=inv_lookup_data)['id']
+            else:
+                workflow_node_fields['inventory'] = module.get_one('inventories', name_or_id=workflow_node['inventory'])['id']
 
         # Set Search fields
         search_fields['workflow_job_template'] = workflow_node_fields['workflow_job_template'] = workflow_id
@@ -581,8 +726,8 @@ def create_schema_nodes(module, response, schema, workflow_id):
             )
 
 
-def create_schema_nodes_association(module, response, schema, workflow_id):
-    for workflow_node in schema:
+def create_workflow_nodes_association(module, response, workflow_nodes, workflow_id):
+    for workflow_node in workflow_nodes:
         workflow_node_fields = {}
         search_fields = {}
         association_fields = {}
@@ -606,15 +751,26 @@ def create_schema_nodes_association(module, response, schema, workflow_id):
             # Get id's for association fields
             association_fields = {}
 
-            for association in ('always_nodes', 'success_nodes', 'failure_nodes', 'credentials'):
+            for association in (
+                'always_nodes',
+                'success_nodes',
+                'failure_nodes',
+                'credentials',
+                'labels',
+                'instance_groups',
+            ):
                 # Extract out information if it exists
                 # Test if it is defined, else move to next association.
+                prompt_lookup = ['credentials', 'labels', 'instance_groups']
                 if association in workflow_node['related']:
                     id_list = []
+                    lookup_data = {}
                     for sub_name in workflow_node['related'][association]:
-                        if association == 'credentials':
-                            endpoint = 'credentials'
-                            lookup_data = {'name': sub_name['name']}
+                        if association in prompt_lookup:
+                            endpoint = association
+                            if 'organization' in sub_name:
+                                lookup_data['organization'] = module.resolve_name_to_id('organizations', sub_name['organization']['name'])
+                            lookup_data['name'] = sub_name['name']
                         else:
                             endpoint = 'workflow_job_template_nodes'
                             lookup_data = {'identifier': sub_name['identifier']}
@@ -636,7 +792,7 @@ def create_schema_nodes_association(module, response, schema, workflow_id):
                     )
 
 
-def destroy_schema_nodes(module, response, workflow_id):
+def destroy_workflow_nodes(module, response, workflow_id):
     search_fields = {}
 
     # Search for existing nodes.
@@ -656,11 +812,16 @@ def main():
         copy_from=dict(),
         description=dict(),
         extra_vars=dict(type='dict'),
+        job_tags=dict(),
+        skip_tags=dict(),
         organization=dict(),
         survey_spec=dict(type='dict', aliases=['survey']),
         survey_enabled=dict(type='bool'),
         allow_simultaneous=dict(type='bool'),
         ask_variables_on_launch=dict(type='bool'),
+        ask_labels_on_launch=dict(type='bool', aliases=['ask_labels']),
+        ask_tags_on_launch=dict(type='bool', aliases=['ask_tags']),
+        ask_skip_tags_on_launch=dict(type='bool', aliases=['ask_skip_tags']),
         inventory=dict(),
         limit=dict(),
         scm_branch=dict(),
@@ -674,9 +835,9 @@ def main():
         notification_templates_success=dict(type="list", elements='str'),
         notification_templates_error=dict(type="list", elements='str'),
         notification_templates_approvals=dict(type="list", elements='str'),
-        schema=dict(type='list', elements='dict'),
-        destroy_current_schema=dict(type='bool', default=False),
-        state=dict(choices=['present', 'absent'], default='present'),
+        workflow_nodes=dict(type='list', elements='dict', aliases=['schema']),
+        destroy_current_nodes=dict(type='bool', default=False, aliases=['destroy_current_schema']),
+        state=dict(choices=['present', 'absent', 'exists'], default='present'),
     )
 
     # Create a module for ourselves
@@ -689,10 +850,10 @@ def main():
     state = module.params.get('state')
 
     # Extract schema parameters
-    schema = None
-    if module.params.get('schema'):
-        schema = module.params.get('schema')
-    destroy_current_schema = module.params.get('destroy_current_schema')
+    workflow_nodes = None
+    if module.params.get('workflow_nodes'):
+        workflow_nodes = module.params.get('workflow_nodes')
+    destroy_current_nodes = module.params.get('destroy_current_nodes')
 
     new_fields = {}
     search_fields = {}
@@ -704,7 +865,7 @@ def main():
         search_fields['organization'] = new_fields['organization'] = organization_id
 
     # Attempt to look up an existing item based on the provided data
-    existing_item = module.get_one('workflow_job_templates', name_or_id=name, **{'data': search_fields})
+    existing_item = module.get_one('workflow_job_templates', name_or_id=name, check_exists=(state == 'exists'), **{'data': search_fields})
 
     # Attempt to look up credential to copy based on the provided name
     if copy_from:
@@ -728,7 +889,7 @@ def main():
 
     webhook_credential = module.params.get('webhook_credential')
     if webhook_credential:
-        new_fields['webhook_credential'] = module.resolve_name_to_id('webhook_credential', webhook_credential)
+        new_fields['webhook_credential'] = module.resolve_name_to_id('credentials', webhook_credential)
 
     # Create the data that gets sent for create and update
     new_fields['name'] = new_name if new_name else (module.get_item_name(existing_item) if existing_item else name)
@@ -743,7 +904,12 @@ def main():
         'ask_scm_branch_on_launch',
         'ask_limit_on_launch',
         'ask_variables_on_launch',
+        'ask_labels_on_launch',
+        'ask_tags_on_launch',
+        'ask_skip_tags_on_launch',
         'webhook_service',
+        'job_tags',
+        'skip_tags',
     ):
         field_val = module.params.get(field_name)
         if field_val is not None:
@@ -817,16 +983,17 @@ def main():
     existing_item = module.get_one('workflow_job_templates', name_or_id=new_name if new_name else name, **{'data': search_fields})
     workflow_job_template_id = existing_item['id']
     # Destroy current nodes if selected.
-    if destroy_current_schema:
-        destroy_schema_nodes(module, response, workflow_job_template_id)
+    if destroy_current_nodes:
+        destroy_workflow_nodes(module, response, workflow_job_template_id)
+        module.json_output['changed'] = True
 
     # Work thorugh and lookup value for schema fields
-    if schema:
+    if workflow_nodes:
         # Create Schema Nodes
-        create_schema_nodes(module, response, schema, workflow_job_template_id)
+        create_workflow_nodes(module, response, workflow_nodes, workflow_job_template_id)
         # Create Schema Associations
-        create_schema_nodes_association(module, response, schema, workflow_job_template_id)
-        module.json_output['schema_creation_data'] = response
+        create_workflow_nodes_association(module, response, workflow_nodes, workflow_job_template_id)
+        module.json_output['node_creation_data'] = response
 
     module.exit_json(**module.json_output)
 

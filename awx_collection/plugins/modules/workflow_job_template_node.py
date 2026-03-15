@@ -20,7 +20,6 @@ short_description: create, update, or destroy Automation Platform Controller wor
 description:
     - Create, update, or destroy Automation Platform Controller workflow job template nodes.
     - Use this to build a graph for a workflow, which dictates what the workflow runs.
-    - Replaces the deprecated tower_workflow_template module schema command.
     - You can create nodes first, and link them afterwards, and not worry about ordering.
       For failsafe referencing of a node, specify identifier, WFJT, and organization.
       With those specified, you can choose to modify or not modify any other parameter.
@@ -30,10 +29,9 @@ options:
         - Variables to apply at launch time.
         - Will only be accepted if job template prompts for vars or has a survey asking for those vars.
       type: dict
-      default: {}
     inventory:
       description:
-        - Inventory applied as a prompt, if job template prompts for inventory
+        - Name, ID, or named URL of the Inventory applied as a prompt, if job template prompts for inventory
       type: str
     scm_branch:
       description:
@@ -75,7 +73,7 @@ options:
         - '5'
     workflow_job_template:
       description:
-        - The workflow job template the node exists in.
+        - The workflow job template name, ID, or named URL the node exists in.
         - Used for looking up the node, cannot be modified after creation.
       required: True
       type: str
@@ -83,7 +81,7 @@ options:
         - workflow
     organization:
       description:
-        - The organization of the workflow job template the node exists in.
+        - The organization name, ID, or named URL of the workflow job template the node exists in.
         - Used for looking up the workflow, not a direct model field.
       type: str
     unified_job_template:
@@ -95,7 +93,7 @@ options:
       type: str
     lookup_organization:
       description:
-        - Organization the inventories, job template, project, inventory source the unified_job_template exists in.
+        - Organization name, ID, or named URL the inventories, job template, project, inventory source the unified_job_template exists in.
         - If not provided, will lookup by name only, which does not work with duplicates.
       type: str
     approval_node:
@@ -147,15 +145,41 @@ options:
       elements: str
     credentials:
       description:
-        - Credentials to be applied to job as launch-time prompts.
-        - List of credential names.
+        - Credential names, IDs, or named URLs to be applied to job as launch-time prompts.
+        - List of credential names, IDs, or named URLs.
         - Uniqueness is not handled rigorously.
       type: list
       elements: str
+    execution_environment:
+      description:
+        - Execution Environment name, ID, or named URL applied as a prompt, assuming job template prompts for execution environment
+      type: str
+    forks:
+      description:
+        - Forks applied as a prompt, assuming job template prompts for forks
+      type: int
+    instance_groups:
+      description:
+        - List of Instance Group names, IDs, or named URLs applied as a prompt, assuming job template prompts for instance groups
+      type: list
+      elements: str
+    job_slice_count:
+      description:
+        - Job Slice Count applied as a prompt, assuming job template prompts for job slice count
+      type: int
+    labels:
+      description:
+        - List of labels applied as a prompt, assuming job template prompts for labels
+      type: list
+      elements: str
+    timeout:
+      description:
+        - Timeout applied as a prompt, assuming job template prompts for timeout
+      type: int
     state:
       description:
         - Desired state of the resource.
-      choices: ["present", "absent"]
+      choices: ["present", "absent", "exists"]
       default: "present"
       type: str
 extends_documentation_fragment: awx.awx.auth
@@ -182,51 +206,51 @@ EXAMPLES = '''
 
 - name: Create workflow with 2 Job Templates and an approval node in between
   block:
-  - name: Create a workflow job template
-    tower_workflow_job_template:
-      name: my-workflow-job-template
-      ask_scm_branch_on_launch: true
-      organization: Default
+    - name: Create a workflow job template
+      tower_workflow_job_template:
+        name: my-workflow-job-template
+        ask_scm_branch_on_launch: true
+        organization: Default
 
-  - name: Create 1st node
-    tower_workflow_job_template_node:
-      identifier: my-first-node
-      workflow_job_template: my-workflow-job-template
-      unified_job_template: some_job_template
-      organization: Default
+    - name: Create 1st node
+      tower_workflow_job_template_node:
+        identifier: my-first-node
+        workflow_job_template: my-workflow-job-template
+        unified_job_template: some_job_template
+        organization: Default
 
-  - name: Create 2nd approval node
-    tower_workflow_job_template_node:
-      identifier: my-second-approval-node
-      workflow_job_template: my-workflow-job-template
-      organization: Default
-      approval_node:
-        description: "Do this?"
-        name: my-second-approval-node
-        timeout: 3600
+    - name: Create 2nd approval node
+      tower_workflow_job_template_node:
+        identifier: my-second-approval-node
+        workflow_job_template: my-workflow-job-template
+        organization: Default
+        approval_node:
+          description: "Do this?"
+          name: my-second-approval-node
+          timeout: 3600
 
-  - name: Create 3rd node
-    tower_workflow_job_template_node:
-      identifier: my-third-node
-      workflow_job_template: my-workflow-job-template
-      unified_job_template: some_other_job_template
-      organization: Default
+    - name: Create 3rd node
+      tower_workflow_job_template_node:
+        identifier: my-third-node
+        workflow_job_template: my-workflow-job-template
+        unified_job_template: some_other_job_template
+        organization: Default
 
-  - name: Link 1st node to 2nd Approval node
-    tower_workflow_job_template_node:
-      identifier: my-first-node
-      workflow_job_template: my-workflow-job-template
-      organization: Default
-      success_nodes:
-        - my-second-approval-node
+    - name: Link 1st node to 2nd Approval node
+      tower_workflow_job_template_node:
+        identifier: my-first-node
+        workflow_job_template: my-workflow-job-template
+        organization: Default
+        success_nodes:
+          - my-second-approval-node
 
-  - name: Link 2nd Approval Node 3rd node
-    tower_workflow_job_template_node:
-      identifier: my-second-approval-node
-      workflow_job_template: my-workflow-job-template
-      organization: Default
-      success_nodes:
-        - my-third-node
+    - name: Link 2nd Approval Node 3rd node
+      tower_workflow_job_template_node:
+        identifier: my-second-approval-node
+        workflow_job_template: my-workflow-job-template
+        organization: Default
+        success_nodes:
+          - my-third-node
 '''
 
 from ..module_utils.controller_api import ControllerAPIModule
@@ -255,7 +279,13 @@ def main():
         always_nodes=dict(type='list', elements='str'),
         failure_nodes=dict(type='list', elements='str'),
         credentials=dict(type='list', elements='str'),
-        state=dict(choices=['present', 'absent'], default='present'),
+        execution_environment=dict(type='str'),
+        forks=dict(type='int'),
+        instance_groups=dict(type='list', elements='str'),
+        job_slice_count=dict(type='int'),
+        labels=dict(type='list', elements='str'),
+        timeout=dict(type='int'),
+        state=dict(choices=['present', 'absent', 'exists'], default='present'),
     )
     mutually_exclusive = [("unified_job_template", "approval_node")]
     required_if = [
@@ -290,14 +320,18 @@ def main():
             wfjt_search_fields['organization'] = organization_id
         wfjt_data = module.get_one('workflow_job_templates', name_or_id=workflow_job_template, **{'data': wfjt_search_fields})
         if wfjt_data is None:
-            module.fail_json(
-                msg="The workflow {0} in organization {1} was not found on the controller instance server".format(workflow_job_template, organization)
-            )
+            if state == 'absent':
+                # if the workflow doesn't exist, it can't have workflow nodes.
+                module.exit_json(**module.json_output)
+            else:
+                module.fail_json(
+                    msg="The workflow {0} in organization {1} was not found on the controller instance server".format(workflow_job_template, organization)
+                )
         workflow_job_template_id = wfjt_data['id']
         search_fields['workflow_job_template'] = new_fields['workflow_job_template'] = workflow_job_template_id
 
     # Attempt to look up an existing item based on the provided data
-    existing_item = module.get_one('workflow_job_template_nodes', **{'data': search_fields})
+    existing_item = module.get_one('workflow_job_template_nodes', check_exists=(state == 'exists'), **{'data': search_fields})
 
     if state == 'absent':
         # If the state was absent we can let the module delete it if needed, the module will handle exiting from this
@@ -310,7 +344,10 @@ def main():
 
     unified_job_template = module.params.get('unified_job_template')
     if unified_job_template:
-        new_fields['unified_job_template'] = module.get_one('unified_job_templates', name_or_id=unified_job_template, **{'data': search_fields})['id']
+        ujt = module.get_one('unified_job_templates', name_or_id=unified_job_template, **{'data': search_fields})
+        if ujt is None or 'id' not in ujt:
+            module.fail_json(msg=f'Could not get unified_job_template name_or_id={unified_job_template} search_fields={search_fields}, got {ujt}')
+        new_fields['unified_job_template'] = ujt['id']
     inventory = module.params.get('inventory')
     if inventory:
         new_fields['inventory'] = module.resolve_name_to_id('inventories', inventory)
@@ -327,32 +364,44 @@ def main():
         'diff_mode',
         'verbosity',
         'all_parents_must_converge',
+        'forks',
+        'job_slice_count',
+        'timeout',
     ):
         field_val = module.params.get(field_name)
         if field_val:
             new_fields[field_name] = field_val
 
     association_fields = {}
-    for association in ('always_nodes', 'success_nodes', 'failure_nodes', 'credentials'):
+    for association in ('always_nodes', 'success_nodes', 'failure_nodes', 'credentials', 'instance_groups', 'labels'):
         name_list = module.params.get(association)
         if name_list is None:
             continue
         id_list = []
         for sub_name in name_list:
-            if association == 'credentials':
-                endpoint = 'credentials'
-                lookup_data = {'name': sub_name}
+            if association in ['credentials', 'instance_groups', 'labels']:
+                sub_obj = module.get_one(association, name_or_id=sub_name)
             else:
                 endpoint = 'workflow_job_template_nodes'
                 lookup_data = {'identifier': sub_name}
                 if workflow_job_template_id:
                     lookup_data['workflow_job_template'] = workflow_job_template_id
-            sub_obj = module.get_one(endpoint, **{'data': lookup_data})
+                sub_obj = module.get_one(endpoint, **{'data': lookup_data})
             if sub_obj is None:
                 module.fail_json(msg='Could not find {0} entry with name {1}'.format(association, sub_name))
             id_list.append(sub_obj['id'])
-        if id_list:
-            association_fields[association] = id_list
+        association_fields[association] = id_list
+
+    execution_environment = module.params.get('execution_environment')
+    if execution_environment is not None:
+        if execution_environment == '':
+            new_fields['execution_environment'] = ''
+        else:
+            ee = module.get_one('execution_environments', name_or_id=execution_environment)
+            if ee is None:
+                module.fail_json(msg='could not find execution_environment entry with name {0}'.format(execution_environment))
+            else:
+                new_fields['execution_environment'] = ee['id']
 
     # In the case of a new object, the utils need to know it is a node
     new_fields['type'] = 'workflow_job_template_node'

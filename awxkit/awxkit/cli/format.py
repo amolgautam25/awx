@@ -1,11 +1,27 @@
 import locale
 import json
-from distutils.util import strtobool
-
 import yaml
 
 from awxkit.cli.utils import colored
 from awxkit import config
+
+
+def strtobool(val):
+    """Convert a string representation of truth to true (1) or false (0).
+
+    True values are 'y', 'yes', 't', 'true', 'on', and '1'.
+    False values are 'n', 'no', 'f', 'false', 'off', and '0'.
+    Raises ValueError if 'val' is anything else.
+
+    This replaces the deprecated distutils.util.strtobool removed in Python 3.12.
+    """
+    val = val.lower()
+    if val in ('y', 'yes', 't', 'true', 'on', '1'):
+        return 1
+    elif val in ('n', 'no', 'f', 'false', 'off', '0'):
+        return 0
+    else:
+        raise ValueError(f"invalid truth value {val!r}")
 
 
 def get_config_credentials():
@@ -30,12 +46,6 @@ def add_authentication_arguments(parser, env):
         default=env.get('CONTROLLER_HOST', env.get('TOWER_HOST', 'https://127.0.0.1:443')),
         metavar='https://example.awx.org',
     )
-    auth.add_argument(
-        '--conf.token',
-        default=env.get('CONTROLLER_OAUTH_TOKEN', env.get('CONTROLLER_TOKEN', env.get('TOWER_OAUTH_TOKEN', env.get('TOWER_TOKEN', '')))),
-        help='an OAuth2.0 token (get one by using `awx login`)',
-        metavar='TEXT',
-    )
 
     config_username, config_password = get_config_credentials()
     # options configured via cli args take higher precedence than those from the config
@@ -57,6 +67,30 @@ def add_authentication_arguments(parser, env):
         default=not strtobool(env.get('CONTROLLER_VERIFY_SSL', env.get('TOWER_VERIFY_SSL', 'True'))),
         action='store_true',
     )
+
+
+def add_verbose(formatting, env):
+    formatting.add_argument(
+        '-v',
+        '--verbose',
+        dest='conf.verbose',
+        help='print debug-level logs, including requests made',
+        default=strtobool(env.get('CONTROLLER_VERBOSE', env.get('TOWER_VERBOSE', 'f'))),
+        action="store_true",
+    )
+
+
+def add_formatting_import_export(parser, env):
+    formatting = parser.add_argument_group('input/output formatting')
+    formatting.add_argument(
+        '-f',
+        '--conf.format',
+        dest='conf.format',
+        choices=['json', 'yaml'],
+        default=env.get('CONTROLLER_FORMAT', env.get('TOWER_FORMAT', 'json')),
+        help=('specify a format for the input and output'),
+    )
+    add_verbose(formatting, env)
 
 
 def add_output_formatting_arguments(parser, env):
@@ -84,14 +118,7 @@ def add_output_formatting_arguments(parser, env):
         default=env.get('CONTROLLER_COLOR', env.get('TOWER_COLOR', 't')),
         type=strtobool,
     )
-    formatting.add_argument(
-        '-v',
-        '--verbose',
-        dest='conf.verbose',
-        help='print debug-level logs, including requests made',
-        default=strtobool(env.get('CONTROLLER_VERBOSE', env.get('TOWER_VERBOSE', 'f'))),
-        action="store_true",
-    )
+    add_verbose(formatting, env)
 
 
 def format_response(response, fmt='json', filter='.', changed=False):
@@ -122,7 +149,7 @@ def format_jq(output, fmt):
         if fmt == '.':
             return output
         raise ImportError(
-            'To use `-f jq`, you must install the optional jq dependency.\n' '`pip install jq`\n',
+            'To use `-f jq`, you must install the optional jq dependency.\n`pip install jq`\n',
             'Note that some platforms may require additional programs to '
             'build jq from source (like `libtool`).\n'
             'See https://pypi.org/project/jq/ for instructions.',
@@ -168,7 +195,7 @@ def format_human(output, fmt):
 
     def format_num(v):
         try:
-            return locale.format("%.*f", (0, int(v)), True)
+            return locale.format_string("%.*f", (0, int(v)), True)
         except (ValueError, TypeError):
             if isinstance(v, (list, dict)):
                 return json.dumps(v)

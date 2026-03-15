@@ -5,22 +5,11 @@ import requests
 from awxkit import exceptions as exc
 from awxkit.config import config
 
-
 log = logging.getLogger(__name__)
 
 
 class ConnectionException(exc.Common):
-
     pass
-
-
-class Token_Auth(requests.auth.AuthBase):
-    def __init__(self, token):
-        self.token = token
-
-    def __call__(self, request):
-        request.headers['Authorization'] = 'Bearer {0.token}'.format(self)
-        return request
 
 
 def log_elapsed(r, *args, **kwargs):  # requests hook to display API elapsed time
@@ -44,27 +33,30 @@ class Connection(object):
         self.session = requests.Session()
         self.uses_session_cookie = False
 
-    def get_session_requirements(self, next='/api/'):
-        self.get('/api/')  # this causes a cookie w/ the CSRF token to be set
+    def get_session_requirements(self, next=config.api_base_path):
+        self.get(config.api_base_path)  # this causes a cookie w/ the CSRF token to be set
         return dict(next=next)
 
-    def login(self, username=None, password=None, token=None, **kwargs):
+    def login(self, username=None, password=None, **kwargs):
         if username and password:
             _next = kwargs.get('next')
             if _next:
                 headers = self.session.headers.copy()
-                response = self.post('/api/login/', headers=headers, data=dict(username=username, password=password, next=_next))
+                response = self.post(f"{config.api_base_path}login/", headers=headers, data=dict(username=username, password=password, next=_next))
                 # The login causes a redirect so we need to search the history of the request to find the header
                 for historical_response in response.history:
                     if 'X-API-Session-Cookie-Name' in historical_response.headers:
                         self.session_cookie_name = historical_response.headers.get('X-API-Session-Cookie-Name')
 
                 self.session_id = self.session.cookies.get(self.session_cookie_name, None)
+                if self.session_id is None and config.get("api_base_path") == "/api/controller/":
+                    # Use gateway session cookie name if controller session cookie name is not found
+                    self.session_cookie_name = "gateway_sessionid"
+                    self.session_id = self.session.cookies.get(self.session_cookie_name, None)
+
                 self.uses_session_cookie = True
             else:
                 self.session.auth = (username, password)
-        elif token:
-            self.session.auth = Token_Auth(token)
         else:
             self.session.auth = None
 

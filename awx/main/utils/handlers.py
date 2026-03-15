@@ -2,10 +2,13 @@
 # All Rights Reserved.
 
 # Python
+import base64
 import logging
+import logging.handlers
 import sys
 import traceback
-from datetime import datetime
+import os
+from datetime import datetime, timezone
 
 # Django
 from django.conf import settings
@@ -15,9 +18,19 @@ from django.utils.encoding import force_str
 # AWX
 from awx.main.exceptions import PostRunError
 
+# OTEL
+from opentelemetry._logs import set_logger_provider
+from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter as OTLPGrpcLogExporter
+from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter as OTLPHttpLogExporter
+
+from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+from opentelemetry.sdk.resources import Resource
+
+__all__ = ['RSysLogHandler', 'SpecialInventoryHandler', 'ColorHandler']
+
 
 class RSysLogHandler(logging.handlers.SysLogHandler):
-
     append_nul = False
 
     def _connect_unixsocket(self, address):
@@ -36,7 +49,7 @@ class RSysLogHandler(logging.handlers.SysLogHandler):
         # because the alternative is blocking the
         # socket.send() in the Python process, which we definitely don't
         # want to do)
-        dt = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        dt = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
         msg = f'{dt} ERROR rsyslogd was unresponsive: '
         exc = traceback.format_exc()
         try:
@@ -76,7 +89,7 @@ class SpecialInventoryHandler(logging.Handler):
     def emit(self, record):
         # check cancel and timeout status regardless of log level
         this_time = now()
-        if (this_time - self.last_check).total_seconds() > 0.5:  # cancel callback is expensive
+        if (this_time - self.last_check).total_seconds() > 0.1:
             self.last_check = this_time
             if self.cancel_callback():
                 raise PostRunError('Inventory update has been canceled', status='canceled')
@@ -98,35 +111,71 @@ class SpecialInventoryHandler(logging.Handler):
         self.event_handler(dispatch_data)
 
 
-ColorHandler = logging.StreamHandler
-
 if settings.COLOR_LOGS is True:
-    try:
-        from logutils.colorize import ColorizingStreamHandler
+    from logutils.colorize import ColorizingStreamHandler
+    import colorama
 
-        class ColorHandler(ColorizingStreamHandler):
-            def colorize(self, line, record):
-                # comment out this method if you don't like the job_lifecycle
-                # logs rendered with cyan text
-                previous_level_map = self.level_map.copy()
-                if record.name == "awx.analytics.job_lifecycle":
-                    self.level_map[logging.DEBUG] = (None, 'cyan', True)
-                msg = super(ColorHandler, self).colorize(line, record)
-                self.level_map = previous_level_map
-                return msg
+    colorama.deinit()
+    colorama.init(wrap=False, convert=False, strip=False)
 
-            def format(self, record):
-                message = logging.StreamHandler.format(self, record)
-                return '\n'.join([self.colorize(line, record) for line in message.splitlines()])
+    class ColorHandler(ColorizingStreamHandler):
+        def colorize(self, line, record):
+            # comment out this method if you don't like the job_lifecycle
+            # logs rendered with cyan text
+            previous_level_map = self.level_map.copy()
+            if record.name == "awx.analytics.job_lifecycle":
+                self.level_map[logging.INFO] = (None, 'cyan', True)
+            msg = super(ColorHandler, self).colorize(line, record)
+            self.level_map = previous_level_map
+            return msg
 
-            level_map = {
-                logging.DEBUG: (None, 'green', True),
-                logging.INFO: (None, None, True),
-                logging.WARNING: (None, 'yellow', True),
-                logging.ERROR: (None, 'red', True),
-                logging.CRITICAL: (None, 'red', True),
-            }
+        def format(self, record):
+            message = logging.StreamHandler.format(self, record)
+            return '\n'.join([self.colorize(line, record) for line in message.splitlines()])
 
-    except ImportError:
-        # logutils is only used for colored logs in the dev environment
-        pass
+        level_map = {
+            logging.DEBUG: (None, 'green', True),
+            logging.INFO: (None, None, True),
+            logging.WARNING: (None, 'yellow', True),
+            logging.ERROR: (None, 'red', True),
+            logging.CRITICAL: (None, 'red', True),
+        }
+
+else:
+    ColorHandler = logging.StreamHandler
+
+
+class OTLPHandler(LoggingHandler):
+    def __init__(self, endpoint=None, protocol='grpc', service_name=None, instance_id=None, auth=None, username=None, password=None):
+        if not endpoint:
+            raise ValueError("endpoint required")
+
+        if auth == 'basic' and (username is None or password is None):
+            raise ValueError("auth type basic requires username and passsword parameters")
+
+        self.endpoint = endpoint
+        self.service_name = service_name or (sys.argv[1] if len(sys.argv) > 1 else (sys.argv[0] or 'unknown_service'))
+        self.instance_id = instance_id or os.uname().nodename
+
+        logger_provider = LoggerProvider(
+            resource=Resource.create(
+                {
+                    "service.name": self.service_name,
+                    "service.instance.id": self.instance_id,
+                }
+            ),
+        )
+        set_logger_provider(logger_provider)
+
+        headers = {}
+        if auth == 'basic':
+            secret = f'{username}:{password}'
+            headers['Authorization'] = "Basic " + base64.b64encode(secret.encode()).decode()
+
+        if protocol == 'grpc':
+            otlp_exporter = OTLPGrpcLogExporter(endpoint=self.endpoint, insecure=True, headers=headers)
+        elif protocol == 'http':
+            otlp_exporter = OTLPHttpLogExporter(endpoint=self.endpoint, headers=headers)
+        logger_provider.add_log_record_processor(BatchLogRecordProcessor(otlp_exporter))
+
+        super().__init__(level=logging.NOTSET, logger_provider=logger_provider)

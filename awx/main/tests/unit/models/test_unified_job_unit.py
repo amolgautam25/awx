@@ -1,4 +1,3 @@
-import pytest
 from unittest import mock
 
 from awx.main.models import UnifiedJob, UnifiedJobTemplate, WorkflowJob, WorkflowJobNode, WorkflowApprovalTemplate, Job, User, Project, JobTemplate, Inventory
@@ -20,40 +19,6 @@ def test_unified_job_workflow_attributes():
 
         assert job.spawned_by_workflow is True
         assert job.workflow_job_id == 1
-
-
-@pytest.fixture
-def unified_job(mocker):
-    mocker.patch.object(UnifiedJob, 'can_cancel', return_value=True)
-    j = UnifiedJob()
-    j.status = 'pending'
-    j.cancel_flag = None
-    j.save = mocker.MagicMock()
-    j.websocket_emit_status = mocker.MagicMock()
-    return j
-
-
-def test_cancel(unified_job):
-
-    unified_job.cancel()
-
-    assert unified_job.cancel_flag is True
-    assert unified_job.status == 'canceled'
-    assert unified_job.job_explanation == ''
-    # Note: the websocket emit status check is just reflecting the state of the current code.
-    # Some more thought may want to go into only emitting canceled if/when the job record
-    # status is changed to canceled. Unlike, currently, where it's emitted unconditionally.
-    unified_job.websocket_emit_status.assert_called_with("canceled")
-    unified_job.save.assert_called_with(update_fields=['cancel_flag', 'start_args', 'status'])
-
-
-def test_cancel_job_explanation(unified_job):
-    job_explanation = 'giggity giggity'
-
-    unified_job.cancel(job_explanation=job_explanation)
-
-    assert unified_job.job_explanation == job_explanation
-    unified_job.save.assert_called_with(update_fields=['cancel_flag', 'start_args', 'status', 'job_explanation'])
 
 
 def test_organization_copy_to_jobs():
@@ -95,7 +60,11 @@ class TestMetaVars:
             result_hash['{}_user_id'.format(name)] = 47
             result_hash['{}_inventory_id'.format(name)] = 45
             result_hash['{}_inventory_name'.format(name)] = 'example-inv'
-        assert Job(name='fake-job', pk=42, id=42, launch_type='manual', created_by=maker, inventory=inv).awx_meta_vars() == result_hash
+            result_hash['{}_execution_node'.format(name)] = 'example-exec-node'
+        assert (
+            Job(name='fake-job', pk=42, id=42, launch_type='manual', created_by=maker, inventory=inv, execution_node='example-exec-node').awx_meta_vars()
+            == result_hash
+        )
 
     def test_project_update_metavars(self):
         data = Job(

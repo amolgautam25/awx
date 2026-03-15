@@ -23,7 +23,7 @@ options:
     manifest:
       description:
         - file path to a Red Hat subscription manifest (a .zip file)
-      required: True
+      required: False
       type: str
     force:
       description:
@@ -31,6 +31,17 @@ options:
           unlicensed or trial licensed.  When force=true, the license is always applied.
       type: bool
       default: 'False'
+    subscription_id:
+      description:
+        - Red Hat or Red Hat Satellite subscription_id to attach to
+      required: False
+      type: str
+    state:
+      description:
+        - Desired state of the resource.
+      default: "present"
+      choices: ["present", "absent"]
+      type: str
 extends_documentation_fragment: awx.awx.auth
 '''
 
@@ -40,9 +51,23 @@ EXAMPLES = '''
 - name: Set the license using a file
   license:
     manifest: "/tmp/my_manifest.zip"
+
+- name: Use the subscriptions module to fetch subscriptions from Red Hat or Red Hat Satellite
+  subscriptions:
+    username: "my_satellite_username"
+    password: "my_satellite_password"
+
+- name: Attach to a subscription (requires fetching subscriptions at least once before)
+  license:
+    subscription_id: 123456
+
+- name: Remove license
+  license:
+    state: absent
 '''
 
 import base64
+
 from ..module_utils.controller_api import ControllerAPIModule
 
 
@@ -50,18 +75,31 @@ def main():
 
     module = ControllerAPIModule(
         argument_spec=dict(
-            manifest=dict(type='str', required=True),
+            manifest=dict(type='str', required=False),
+            subscription_id=dict(type='str', required=False),
             force=dict(type='bool', default=False),
+            state=dict(choices=['present', 'absent'], default='present'),
         ),
+        required_if=[
+            ['state', 'present', ['manifest', 'subscription_id'], True],
+        ],
+        mutually_exclusive=[("manifest", "subscription_id")],
     )
 
     json_output = {'changed': False}
 
-    try:
-        with open(module.params.get('manifest'), 'rb') as fid:
-            manifest = base64.b64encode(fid.read())
-    except OSError as e:
-        module.fail_json(msg=str(e))
+    # If the state was absent we can delete the endpoint and exit.
+    state = module.params.get('state')
+    if state == 'absent':
+        module.delete_endpoint('config')
+        module.exit_json(**json_output)
+
+    if module.params.get('manifest', None):
+        try:
+            with open(module.params.get('manifest'), 'rb') as fid:
+                manifest = base64.b64encode(fid.read())
+        except OSError as e:
+            module.fail_json(msg=str(e))
 
     # Check if Tower is already licensed
     config = module.get_endpoint('config')['json']
@@ -83,8 +121,17 @@ def main():
 
     # Do the actual install, if we need to
     if perform_install:
+        if module.params.get('manifest', None):
+            response = module.post_endpoint('config', data={'manifest': manifest.decode()})
+        else:
+            response = module.post_endpoint('config/attach', data={'subscription_id': module.params.get('subscription_id')})
+
+        # Check API response for errors (AAP-44277 fix)
+        if response and response.get('status_code') and response.get('status_code') != 200:
+            error_msg = response.get('json', {}).get('error', 'License operation failed')
+            module.fail_json(msg=error_msg)
+
         json_output['changed'] = True
-        module.post_endpoint('config', data={'manifest': manifest.decode()})
 
     module.exit_json(**json_output)
 

@@ -10,14 +10,17 @@ import json
 import logging
 import os
 import re
-import socket
 import subprocess
 import tempfile
 from collections import OrderedDict
 
+# Dispatcher
+from dispatcherd.factories import get_control_from_settings
+
 # Django
 from django.conf import settings
-from django.db import models, connection
+from django.db import models, connection, transaction
+from django.db.models.constraints import UniqueConstraint
 from django.core.exceptions import NON_FIELD_ERRORS
 from django.utils.translation import gettext_lazy as _
 from django.utils.timezone import now
@@ -30,22 +33,26 @@ from rest_framework.exceptions import ParseError
 # Django-Polymorphic
 from polymorphic.models import PolymorphicModel
 
+from ansible_base.lib.utils.models import prevent_search, get_type_for_model
+from ansible_base.rbac import permission_registry
+from ansible_base.rbac.models import RoleEvaluation
+
 # AWX
-from awx.main.models.base import CommonModelNameNotUnique, PasswordFieldsModel, NotificationFieldsModel, prevent_search
-from awx.main.dispatch import get_local_queuename
-from awx.main.dispatch.control import Control as ControlDispatcher
+from awx.main.models.base import CommonModelNameNotUnique, PasswordFieldsModel, NotificationFieldsModel
+from awx.main.dispatch import get_task_queuename
 from awx.main.registrar import activity_stream_registrar
-from awx.main.models.mixins import ResourceMixin, TaskManagerUnifiedJobMixin, ExecutionEnvironmentMixin
+from awx.main.models.mixins import TaskManagerUnifiedJobMixin, ExecutionEnvironmentMixin
+from awx.main.models.rbac import to_permissions
 from awx.main.utils.common import (
     camelcase_to_underscore,
     get_model_for_type,
     _inventory_updates,
     copy_model_by_class,
     copy_m2m_relationships,
-    get_type_for_model,
     parse_yaml_or_json,
     getattr_dne,
-    schedule_task_manager,
+    ScheduleDependencyManager,
+    ScheduleTaskManager,
     get_event_partition_epoch,
     get_capacity_type,
 )
@@ -54,7 +61,7 @@ from awx.main.utils import polymorphic
 from awx.main.constants import ACTIVE_STATES, CAN_CANCEL, JOB_VARIABLE_PREFIXES
 from awx.main.redact import UriCleaner, REPLACE_STR
 from awx.main.consumers import emit_channel_notification
-from awx.main.fields import AskForField, OrderedManyToManyField, JSONBlob
+from awx.main.fields import AskForField, OrderedManyToManyField
 
 __all__ = ['UnifiedJobTemplate', 'UnifiedJob', 'StdoutMaxBytesExceeded']
 
@@ -107,7 +114,10 @@ class UnifiedJobTemplate(PolymorphicModel, CommonModelNameNotUnique, ExecutionEn
         ordering = ('name',)
         # unique_together here is intentionally commented out. Please make sure sub-classes of this model
         # contain at least this uniqueness restriction: SOFT_UNIQUE_TOGETHER = [('polymorphic_ctype', 'name')]
-        # unique_together = [('polymorphic_ctype', 'name', 'organization')]
+        # Unique name constraint - note that inventory source model is excluded from this constraint entirely
+        constraints = [
+            UniqueConstraint(fields=['polymorphic_ctype', 'name', 'organization'], condition=models.Q(org_unique=True), name='ujt_hard_name_constraint')
+        ]
 
     old_pk = models.PositiveIntegerField(
         null=True,
@@ -176,6 +186,9 @@ class UnifiedJobTemplate(PolymorphicModel, CommonModelNameNotUnique, ExecutionEn
     )
     labels = models.ManyToManyField("Label", blank=True, related_name='%(class)s_labels')
     instance_groups = OrderedManyToManyField('InstanceGroup', blank=True, through='UnifiedJobTemplateInstanceGroupMembership')
+    org_unique = models.BooleanField(
+        blank=True, default=True, editable=False, help_text=_('Used internally to selectively enforce database constraint on name')
+    )
 
     def get_absolute_url(self, request=None):
         real_instance = self.get_real_instance()
@@ -194,9 +207,7 @@ class UnifiedJobTemplate(PolymorphicModel, CommonModelNameNotUnique, ExecutionEn
 
     @classmethod
     def _submodels_with_roles(cls):
-        ujt_classes = [c for c in cls.__subclasses__() if c._meta.model_name not in ['inventorysource', 'systemjobtemplate']]
-        ct_dict = ContentType.objects.get_for_models(*ujt_classes)
-        return [ct.id for ct in ct_dict.values()]
+        return [c for c in cls.__subclasses__() if permission_registry.is_registered(c)]
 
     @classmethod
     def accessible_pk_qs(cls, accessor, role_field):
@@ -208,7 +219,24 @@ class UnifiedJobTemplate(PolymorphicModel, CommonModelNameNotUnique, ExecutionEn
         # do not use this if in a subclass
         if cls != UnifiedJobTemplate:
             return super(UnifiedJobTemplate, cls).accessible_pk_qs(accessor, role_field)
-        return ResourceMixin._accessible_pk_qs(cls, accessor, role_field, content_types=cls._submodels_with_roles())
+
+        action = to_permissions[role_field]
+
+        # Special condition for super auditor
+        role_subclasses = cls._submodels_with_roles()
+        all_codenames = {f'{action}_{cls._meta.model_name}' for cls in role_subclasses}
+        if not (all_codenames - accessor.singleton_permissions()):
+            role_cts = ContentType.objects.get_for_models(*role_subclasses).values()
+            qs = cls.objects.filter(polymorphic_ctype__in=role_cts)
+            return qs.values_list('id', flat=True)
+
+        dab_role_cts = permission_registry.content_type_model.objects.get_for_models(*role_subclasses).values()
+
+        return (
+            RoleEvaluation.objects.filter(role__in=accessor.has_roles.all(), codename__in=all_codenames, content_type_id__in=[ct.id for ct in dab_role_cts])
+            .values_list('object_id')
+            .distinct()
+        )
 
     def _perform_unique_checks(self, unique_checks):
         # Handle the list of unique fields returned above. Replace with an
@@ -262,7 +290,14 @@ class UnifiedJobTemplate(PolymorphicModel, CommonModelNameNotUnique, ExecutionEn
         if new_next_schedule:
             if new_next_schedule.pk == self.next_schedule_id and new_next_schedule.next_run == self.next_job_run:
                 return  # no-op, common for infrequent schedules
-            self.next_schedule = new_next_schedule
+
+            # If in a transaction, use select_for_update to lock the next schedule row, which
+            # prevents a race condition if new_next_schedule is deleted elsewhere during this transaction
+            if transaction.get_autocommit():
+                self.next_schedule = related_schedules.first()
+            else:
+                self.next_schedule = related_schedules.select_for_update().first()
+
             self.next_job_run = new_next_schedule.next_run
             self.save(update_fields=['next_schedule', 'next_job_run'])
 
@@ -331,10 +366,11 @@ class UnifiedJobTemplate(PolymorphicModel, CommonModelNameNotUnique, ExecutionEn
 
         return NotificationTemplate.objects.none()
 
-    def create_unified_job(self, **kwargs):
+    def create_unified_job(self, instance_groups=None, **kwargs):
         """
         Create a new unified job based on this unified job template.
         """
+        # TODO: rename kwargs to prompts, to set expectation that these are runtime values
         new_job_passwords = kwargs.pop('survey_passwords', {})
         eager_fields = kwargs.pop('_eager_fields', None)
 
@@ -381,6 +417,14 @@ class UnifiedJobTemplate(PolymorphicModel, CommonModelNameNotUnique, ExecutionEn
             unified_job.survey_passwords = new_job_passwords
             kwargs['survey_passwords'] = new_job_passwords  # saved in config object for relaunch
 
+        if instance_groups:
+            unified_job.preferred_instance_groups_cache = [ig.id for ig in instance_groups]
+        else:
+            unified_job.preferred_instance_groups_cache = unified_job._get_preferred_instance_group_cache()
+
+        unified_job._set_default_dependencies_processed()
+        unified_job.task_impact = unified_job._get_task_impact()
+
         from awx.main.signals import disable_activity_stream, activity_stream_create
 
         with disable_activity_stream():
@@ -406,13 +450,17 @@ class UnifiedJobTemplate(PolymorphicModel, CommonModelNameNotUnique, ExecutionEn
             unified_job.handle_extra_data(validated_kwargs['extra_vars'])
 
         # Create record of provided prompts for relaunch and rescheduling
-        unified_job.create_config_from_prompts(kwargs, parent=self)
+        config = unified_job.create_config_from_prompts(kwargs, parent=self)
+        if instance_groups:
+            for ig in instance_groups:
+                config.instance_groups.add(ig)
 
         # manually issue the create activity stream entry _after_ M2M relations
         # have been associated to the UJ
         if unified_job.__class__ in activity_stream_registrar.models:
             activity_stream_create(None, unified_job, True)
         unified_job.log_lifecycle("created")
+
         return unified_job
 
     @classmethod
@@ -533,7 +581,7 @@ class UnifiedJob(
         ('workflow', _('Workflow')),  # Job was started from a workflow job.
         ('webhook', _('Webhook')),  # Job was started from a webhook event.
         ('sync', _('Sync')),  # Job was started from a project sync.
-        ('scm', _('SCM Update')),  # Job was created as an Inventory SCM sync.
+        ('scm', _('SCM Update')),  # (deprecated) Job was created as an Inventory SCM sync.
     ]
 
     PASSWORD_FIELDS = ('start_args',)
@@ -575,7 +623,8 @@ class UnifiedJob(
     dependent_jobs = models.ManyToManyField(
         'self',
         editable=False,
-        related_name='%(class)s_blocked_jobs+',
+        related_name='%(class)s_blocked_jobs',
+        symmetrical=False,
     )
     execution_node = models.TextField(
         blank=True,
@@ -653,7 +702,7 @@ class UnifiedJob(
         editable=False,
     )
     job_env = prevent_search(
-        JSONBlob(
+        models.JSONField(
             default=dict,
             blank=True,
             editable=False,
@@ -692,6 +741,14 @@ class UnifiedJob(
         on_delete=polymorphic.SET_NULL,
         help_text=_('The Instance group the job was run under'),
     )
+    preferred_instance_groups_cache = models.JSONField(
+        blank=True,
+        null=True,
+        default=None,
+        editable=False,
+        help_text=_("A cached list with pk values from preferred instance groups."),
+    )
+    task_impact = models.PositiveIntegerField(default=0, editable=False, help_text=_("Number of forks an instance consumes when running this job."))
     organization = models.ForeignKey(
         'Organization',
         blank=True,
@@ -716,6 +773,13 @@ class UnifiedJob(
         default='',
         editable=False,
         help_text=_("The version of Ansible Core installed in the execution environment."),
+    )
+    host_status_counts = models.JSONField(
+        blank=True,
+        null=True,
+        default=None,
+        editable=False,
+        help_text=_("Playbook stats from the Ansible playbook_on_stats event."),
     )
     work_unit_id = models.CharField(
         max_length=255, blank=True, default=None, editable=False, null=True, help_text=_("The Receptor work unit ID associated with this job.")
@@ -745,6 +809,9 @@ class UnifiedJob(
 
     def _get_parent_field_name(self):
         return 'unified_job_template'  # Override in subclasses.
+
+    def _get_preferred_instance_group_cache(self):
+        return [ig.pk for ig in self.preferred_instance_groups]
 
     @classmethod
     def _get_unified_job_template_class(cls):
@@ -780,7 +847,7 @@ class UnifiedJob(
                 update_fields.append(key)
 
         if parent_instance:
-            if self.status in ('pending', 'waiting', 'running'):
+            if self.status in ('pending', 'running'):
                 if parent_instance.current_job != self:
                     parent_instance_set('current_job', self)
                 # Update parent with all the 'good' states of it's child
@@ -800,6 +867,9 @@ class UnifiedJob(
             update_fields = self._update_parent_instance_no_save(parent_instance)
             parent_instance.save(update_fields=update_fields)
 
+    def _set_default_dependencies_processed(self):
+        pass
+
     def save(self, *args, **kwargs):
         """Save the job, with current status, to the database.
         Ensure that all data is consistent before doing so.
@@ -813,7 +883,8 @@ class UnifiedJob(
 
         # If this job already exists in the database, retrieve a copy of
         # the job in its prior state.
-        if self.pk:
+        # If update_fields are given without status, then that indicates no change
+        if self.status != 'waiting' and self.pk and ((not update_fields) or ('status' in update_fields)):
             self_before = self.__class__.objects.get(pk=self.pk)
             if self_before.status != self.status:
                 status_before = self_before.status
@@ -847,7 +918,7 @@ class UnifiedJob(
 
         # If we have a start and finished time, and haven't already calculated
         # out the time that elapsed, do so.
-        if self.started and self.finished and self.elapsed == 0.0:
+        if self.started and self.finished and self.elapsed == decimal.Decimal(0):
             td = self.finished - self.started
             elapsed = decimal.Decimal(td.total_seconds())
             self.elapsed = elapsed.quantize(dq)
@@ -855,7 +926,8 @@ class UnifiedJob(
                 update_fields.append('elapsed')
 
         # Ensure that the job template information is current.
-        if self.unified_job_template != self._get_parent_instance():
+        # unless status is 'waiting', because this happens in large batches at end of task manager runs and is blocking
+        if self.status != 'waiting' and self.unified_job_template != self._get_parent_instance():
             self.unified_job_template = self._get_parent_instance()
             if 'unified_job_template' not in update_fields:
                 update_fields.append('unified_job_template')
@@ -868,8 +940,9 @@ class UnifiedJob(
         # Okay; we're done. Perform the actual save.
         result = super(UnifiedJob, self).save(*args, **kwargs)
 
-        # If status changed, update the parent instance.
-        if self.status != status_before:
+        # If status changed, update the parent instance
+        # unless status is 'waiting', because this happens in large batches at end of task manager runs and is blocking
+        if self.status != status_before and self.status != 'waiting':
             # Update parent outside of the transaction for Job w/ allow_simultaneous=True
             # This dodges lock contention at the expense of the foreign key not being
             # completely correct.
@@ -944,22 +1017,38 @@ class UnifiedJob(
             valid_fields.extend(['survey_passwords', 'extra_vars'])
         else:
             kwargs.pop('survey_passwords', None)
+        many_to_many_fields = []
         for field_name, value in kwargs.items():
             if field_name not in valid_fields:
                 raise Exception('Unrecognized launch config field {}.'.format(field_name))
-            if field_name == 'credentials':
+            field = None
+            # may use extra_data as a proxy for extra_vars
+            if field_name in config.SUBCLASS_FIELDS and field_name != 'extra_vars':
+                field = config._meta.get_field(field_name)
+            if isinstance(field, models.ManyToManyField):
+                many_to_many_fields.append(field_name)
                 continue
-            key = field_name
-            if key == 'extra_vars':
-                key = 'extra_data'
-            setattr(config, key, value)
+            if isinstance(field, (models.ForeignKey)) and (value is None):
+                continue  # the null value indicates not-provided for ForeignKey case
+            setattr(config, field_name, value)
         config.save()
 
-        job_creds = set(kwargs.get('credentials', []))
-        if 'credentials' in [field.name for field in parent._meta.get_fields()]:
-            job_creds = job_creds - set(parent.credentials.all())
-        if job_creds:
-            config.credentials.add(*job_creds)
+        for field_name in many_to_many_fields:
+            prompted_items = kwargs.get(field_name, [])
+            if not prompted_items:
+                continue
+            if field_name == 'instance_groups':
+                # Here we are doing a loop to make sure we preserve order for this Ordered field
+                # also do not merge IGs with parent, so this saves the literal list
+                for item in prompted_items:
+                    getattr(config, field_name).add(item)
+            else:
+                # Assuming this field merges prompts with parent, save just the diff
+                if field_name in [field.name for field in parent._meta.get_fields()]:
+                    prompted_items = set(prompted_items) - set(getattr(parent, field_name).all())
+                if prompted_items:
+                    getattr(config, field_name).add(*prompted_items)
+
         return config
 
     @property
@@ -1018,7 +1107,6 @@ class UnifiedJob(
             event_qs = self.get_event_queryset()
         except NotImplementedError:
             return True  # Model without events, such as WFJT
-        self.log_lifecycle("event_processing_finished")
         return self.emitted_events == event_qs.count()
 
     def result_stdout_raw_handle(self, enforce_max_bytes=True):
@@ -1077,7 +1165,6 @@ class UnifiedJob(
             # (`stdout`) directly to a file
 
             with connection.cursor() as cursor:
-
                 if enforce_max_bytes:
                     # detect the length of all stdout for this UnifiedJob, and
                     # if it exceeds settings.STDOUT_MAX_BYTES_DISPLAY bytes,
@@ -1086,11 +1173,6 @@ class UnifiedJob(
                     if total > max_supported:
                         raise StdoutMaxBytesExceeded(total, max_supported)
 
-                # psycopg2's copy_expert writes bytes, but callers of this
-                # function assume a str-based fd will be returned; decode
-                # .write() calls on the fly to maintain this interface
-                _write = fd.write
-                fd.write = lambda s: _write(smart_str(s))
                 tbl = self._meta.db_table + 'event'
                 created_by_cond = ''
                 if self.has_unpartitioned_events:
@@ -1099,7 +1181,12 @@ class UnifiedJob(
                     created_by_cond = f"job_created='{self.created.isoformat()}' AND "
 
                 sql = f"copy (select stdout from {tbl} where {created_by_cond}{self.event_parent_key}={self.id} and stdout != '' order by start_line) to stdout"  # nosql
-                cursor.copy_expert(sql, fd)
+                # psycopg3's copy writes bytes, but callers of this
+                # function assume a str-based fd will be returned; decode
+                # .write() calls on the fly to maintain this interface
+                with cursor.copy(sql) as copy:
+                    while data := copy.read():
+                        fd.write(smart_str(bytes(data)))
 
                 if hasattr(fd, 'name'):
                     # If we're dealing with a physical file, use `sed` to clean
@@ -1113,6 +1200,13 @@ class UnifiedJob(
                     fd = StringIO(fd.getvalue().replace('\\r\\n', '\n'))
                     return fd
 
+    def _fix_double_escapes(self, content):
+        """
+        Collapse double-escaped sequences into single-escaped form.
+        """
+        # Replace \\ followed by one of ' " \ n r t
+        return re.sub(r'\\([\'"\\nrt])', r'\1', content)
+
     def _escape_ascii(self, content):
         # Remove ANSI escape sequences used to embed event data.
         content = re.sub(r'\x1b\[K(?:[A-Za-z0-9+/=]+\x1b\[\d+D)+\x1b\[K', '', content)
@@ -1120,12 +1214,14 @@ class UnifiedJob(
         content = re.sub(r'\x1b[^m]*m', '', content)
         return content
 
-    def _result_stdout_raw(self, redact_sensitive=False, escape_ascii=False):
+    def _result_stdout_raw(self, redact_sensitive=False, escape_ascii=False, fix_escapes=False):
         content = self.result_stdout_raw_handle().read()
         if redact_sensitive:
             content = UriCleaner.remove_sensitive(content)
         if escape_ascii:
             content = self._escape_ascii(content)
+        if fix_escapes:
+            content = self._fix_double_escapes(content)
         return content
 
     @property
@@ -1134,9 +1230,10 @@ class UnifiedJob(
 
     @property
     def result_stdout(self):
-        return self._result_stdout_raw(escape_ascii=True)
+        # Human-facing output should fix escapes
+        return self._result_stdout_raw(escape_ascii=True, fix_escapes=True)
 
-    def _result_stdout_raw_limited(self, start_line=0, end_line=None, redact_sensitive=True, escape_ascii=False):
+    def _result_stdout_raw_limited(self, start_line=0, end_line=None, redact_sensitive=True, escape_ascii=False, fix_escapes=False):
         return_buffer = StringIO()
         if end_line is not None:
             end_line = int(end_line)
@@ -1159,14 +1256,18 @@ class UnifiedJob(
             return_buffer = UriCleaner.remove_sensitive(return_buffer)
         if escape_ascii:
             return_buffer = self._escape_ascii(return_buffer)
+        if fix_escapes:
+            return_buffer = self._fix_double_escapes(return_buffer)
 
         return return_buffer, start_actual, end_actual, absolute_end
 
     def result_stdout_raw_limited(self, start_line=0, end_line=None, redact_sensitive=False):
+        # Raw should NOT fix escapes
         return self._result_stdout_raw_limited(start_line, end_line, redact_sensitive)
 
     def result_stdout_limited(self, start_line=0, end_line=None, redact_sensitive=False):
-        return self._result_stdout_raw_limited(start_line, end_line, redact_sensitive, escape_ascii=True)
+        # Human-facing should fix escapes
+        return self._result_stdout_raw_limited(start_line, end_line, redact_sensitive, escape_ascii=True, fix_escapes=True)
 
     @property
     def workflow_job_id(self):
@@ -1195,6 +1296,10 @@ class UnifiedJob(
             except UnifiedJob.unified_job_node.RelatedObjectDoesNotExist:
                 pass
         return None
+
+    def get_effective_artifacts(self, **kwargs):
+        """Return unified job artifacts (from set_stats) to pass downstream in workflows"""
+        return {}
 
     def get_passwords_needed_to_start(self):
         return []
@@ -1229,9 +1334,8 @@ class UnifiedJob(
         except JobLaunchConfig.DoesNotExist:
             return False
 
-    @property
-    def task_impact(self):
-        raise NotImplementedError  # Implement in subclass.
+    def _get_task_impact(self):
+        return self.task_impact  # return default, should implement in subclass.
 
     def websocket_emit_data(self):
         '''Return extra data that should be included when submitting data to the browser over the websocket connection'''
@@ -1243,7 +1347,7 @@ class UnifiedJob(
     def _websocket_emit_status(self, status):
         try:
             status_data = dict(unified_job_id=self.id, status=status)
-            if status == 'waiting':
+            if status == 'running':
                 if self.instance_group:
                     status_data['instance_group_name'] = self.instance_group.name
                 else:
@@ -1280,7 +1384,30 @@ class UnifiedJob(
             traceback=self.result_traceback,
         )
 
-    def pre_start(self, **kwargs):
+    def get_start_kwargs(self):
+        needed = self.get_passwords_needed_to_start()
+
+        decrypted_start_args = decrypt_field(self, 'start_args')
+
+        if not decrypted_start_args or decrypted_start_args == '{}':
+            return None
+
+        try:
+            start_args = json.loads(decrypted_start_args)
+        except Exception:
+            logger.exception(f'Unexpected malformed start_args on unified_job={self.id}')
+            return None
+
+        opts = dict([(field, start_args.get(field, '')) for field in needed])
+
+        if not all(opts.values()):
+            missing_fields = ', '.join([k for k, v in opts.items() if not v])
+            self.job_explanation = u'Missing needed fields: %s.' % missing_fields
+            self.save(update_fields=['job_explanation'])
+
+        return opts
+
+    def pre_start(self):
         if not self.can_start:
             self.job_explanation = u'%s is not in a startable state: %s, expecting one of %s' % (self._meta.verbose_name, self.status, str(('new', 'waiting')))
             self.save(update_fields=['job_explanation'])
@@ -1294,32 +1421,17 @@ class UnifiedJob(
                 if required in defined_fields and not credential.has_input(required):
                     missing_credential_inputs.append(required)
 
-        if missing_credential_inputs:
-            self.job_explanation = '{} cannot start because Credential {} does not provide one or more required fields ({}).'.format(
-                self._meta.verbose_name.title(), credential.name, ', '.join(sorted(missing_credential_inputs))
-            )
-            self.save(update_fields=['job_explanation'])
+            if missing_credential_inputs:
+                self.job_explanation = '{} cannot start because Credential {} does not provide one or more required fields ({}).'.format(
+                    self._meta.verbose_name.title(), credential.name, ', '.join(sorted(missing_credential_inputs))
+                )
+                self.save(update_fields=['job_explanation'])
+                return (False, None)
+
+        opts = self.get_start_kwargs()
+
+        if opts and (not all(opts.values())):
             return (False, None)
-
-        needed = self.get_passwords_needed_to_start()
-        try:
-            start_args = json.loads(decrypt_field(self, 'start_args'))
-        except Exception:
-            start_args = None
-
-        if start_args in (None, ''):
-            start_args = kwargs
-
-        opts = dict([(field, start_args.get(field, '')) for field in needed])
-
-        if not all(opts.values()):
-            missing_fields = ', '.join([k for k, v in opts.items() if not v])
-            self.job_explanation = u'Missing needed fields: %s.' % missing_fields
-            self.save(update_fields=['job_explanation'])
-            return (False, None)
-
-        if 'extra_vars' in kwargs:
-            self.handle_extra_data(kwargs['extra_vars'])
 
         # remove any job_explanations that may have been set while job was in pending
         if self.job_explanation != "":
@@ -1346,7 +1458,10 @@ class UnifiedJob(
         self.update_fields(start_args=json.dumps(kwargs), status='pending')
         self.websocket_emit_status("pending")
 
-        schedule_task_manager()
+        if self.dependencies_processed:
+            ScheduleTaskManager().schedule()
+        else:
+            ScheduleDependencyManager().schedule()
 
         # Each type of unified job has a different Task class; get the
         # appropirate one.
@@ -1362,22 +1477,6 @@ class UnifiedJob(
         return True
 
     @property
-    def actually_running(self):
-        # returns True if the job is running in the appropriate dispatcher process
-        running = False
-        if all([self.status == 'running', self.celery_task_id, self.execution_node]):
-            # If the job is marked as running, but the dispatcher
-            # doesn't know about it (or the dispatcher doesn't reply),
-            # then cancel the job
-            timeout = 5
-            try:
-                running = self.celery_task_id in ControlDispatcher('dispatcher', self.controller_node or self.execution_node).running(timeout=timeout)
-            except (socket.timeout, RuntimeError):
-                logger.error('could not reach dispatcher on {} within {}s'.format(self.execution_node, timeout))
-                running = False
-        return running
-
-    @property
     def can_cancel(self):
         return bool(self.status in CAN_CANCEL)
 
@@ -1386,27 +1485,47 @@ class UnifiedJob(
             return 'Previous Task Canceled: {"job_type": "%s", "job_name": "%s", "job_id": "%s"}' % (self.model_to_str(), self.name, self.id)
         return None
 
+    def cancel_dispatcher_process(self):
+        """Returns True if dispatcher running this job acknowledged request and sent SIGTERM"""
+        if not self.celery_task_id:
+            return False
+
+        try:
+            logger.info(f'Sending cancel message to pg_notify channel {self.controller_node} for task {self.celery_task_id}')
+            ctl = get_control_from_settings(default_publish_channel=self.controller_node)
+            ctl.control('cancel', data={'uuid': self.celery_task_id})
+        except Exception:
+            logger.exception("Error sending cancel command to dispatcher")
+
     def cancel(self, job_explanation=None, is_chain=False):
         if self.can_cancel:
             if not is_chain:
                 for x in self.get_jobs_fail_chain():
                     x.cancel(job_explanation=self._build_job_explanation(), is_chain=True)
 
+            cancel_fields = []
             if not self.cancel_flag:
                 self.cancel_flag = True
                 self.start_args = ''  # blank field to remove encrypted passwords
-                cancel_fields = ['cancel_flag', 'start_args']
-                if self.status in ('pending', 'waiting', 'new'):
-                    self.status = 'canceled'
-                    cancel_fields.append('status')
-                if self.status == 'running' and not self.actually_running:
-                    self.status = 'canceled'
-                    cancel_fields.append('status')
+                cancel_fields.extend(['cancel_flag', 'start_args'])
+                connection.on_commit(lambda: self.websocket_emit_status("canceled"))
+
                 if job_explanation is not None:
                     self.job_explanation = job_explanation
                     cancel_fields.append('job_explanation')
+
+                # Important to save here before sending cancel signal to dispatcher to cancel because
+                # the job control process will use the cancel_flag to distinguish a shutdown from a cancel
                 self.save(update_fields=cancel_fields)
-                self.websocket_emit_status("canceled")
+
+            # Be extra sure we have the task id, in case job is transitioning into running right now
+            if not self.celery_task_id:
+                self.refresh_from_db(fields=['celery_task_id', 'controller_node'])
+
+            # send pg_notify message to cancel, will not send until transaction completes
+            if self.celery_task_id:
+                self.cancel_dispatcher_process()
+
         return self.cancel_flag
 
     @property
@@ -1490,7 +1609,7 @@ class UnifiedJob(
         return r
 
     def get_queue_name(self):
-        return self.controller_node or self.execution_node or get_local_queuename()
+        return self.controller_node or self.execution_node or get_task_queuename()
 
     @property
     def is_container_group_task(self):
@@ -1503,8 +1622,8 @@ class UnifiedJob(
             'state': state,
             'work_unit_id': self.work_unit_id,
         }
-        if self.unified_job_template:
-            extra["template_name"] = self.unified_job_template.name
+        if self.name:
+            extra["task_name"] = self.name
         if state == "blocked" and blocked_by:
             blocked_by_msg = f"{blocked_by._meta.model_name}-{blocked_by.id}"
             msg = f"{self._meta.model_name}-{self.id} blocked by {blocked_by_msg}"
@@ -1516,7 +1635,8 @@ class UnifiedJob(
             extra["controller_node"] = self.controller_node or "NOT_SET"
         elif state == "execution_node_chosen":
             extra["execution_node"] = self.execution_node or "NOT_SET"
-        logger_job_lifecycle.debug(msg, extra=extra)
+
+        logger_job_lifecycle.info(f"{msg} {json.dumps(extra)}", extra={'lifecycle_data': extra, 'organization_id': self.organization_id})
 
     @property
     def launched_by(self):

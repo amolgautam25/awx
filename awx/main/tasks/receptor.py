@@ -12,9 +12,16 @@ import yaml
 
 # Django
 from django.conf import settings
+from django.db import connections
 
 # Runner
 import ansible_runner
+
+# django-ansible-base
+from ansible_base.lib.utils.db import advisory_lock
+
+# Dispatcherd
+from dispatcherd.publish import task
 
 # AWX
 from awx.main.utils.execution_environments import get_default_pod_spec
@@ -25,13 +32,18 @@ from awx.main.utils.common import (
     cleanup_new_process,
 )
 from awx.main.constants import MAX_ISOLATED_PATH_COLON_DELIMITER
-
+from awx.main.tasks.signals import signal_state, signal_callback, SignalExit
+from awx.main.models import Instance, InstanceLink, UnifiedJob, ReceptorAddress
+from awx.main.dispatch import get_task_queuename
 
 # Receptorctl
 from receptorctl.socket_interface import ReceptorControl
 
+from filelock import FileLock
+
 logger = logging.getLogger('awx.main.tasks.receptor')
 __RECEPTOR_CONF = '/etc/receptor/receptor.conf'
+__RECEPTOR_CONF_LOCKFILE = f'{__RECEPTOR_CONF}.lock'
 RECEPTOR_ACTIVE_STATES = ('Pending', 'Running')
 
 
@@ -41,10 +53,92 @@ class ReceptorConnectionType(Enum):
     STREAMTLS = 2
 
 
-def get_receptor_sockfile():
-    with open(__RECEPTOR_CONF, 'r') as f:
-        data = yaml.safe_load(f)
-    for section in data:
+"""
+Translate receptorctl messages that come in over stdout into
+structured messages. Currently, these are error messages.
+"""
+
+
+class ReceptorErrorBase:
+    _MESSAGE = 'Receptor Error'
+
+    def __init__(self, node: str = 'N/A', state_name: str = 'N/A'):
+        self.node = node
+        self.state_name = state_name
+
+    def __str__(self):
+        return f"{self.__class__.__name__} '{self._MESSAGE}' on node '{self.node}' with state '{self.state_name}'"
+
+
+class WorkUnitError(ReceptorErrorBase):
+    _MESSAGE = 'unknown work unit '
+
+    def __init__(self, work_unit_id: str, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.work_unit_id = work_unit_id
+
+    def __str__(self):
+        return f"{super().__str__()} work unit id '{self.work_unit_id}'"
+
+
+class WorkUnitCancelError(WorkUnitError):
+    _MESSAGE = 'error cancelling remote unit:  unknown work unit '
+
+
+class WorkUnitResultsError(WorkUnitError):
+    _MESSAGE = 'Failed to get results: unknown work unit '
+
+
+class UnknownError(ReceptorErrorBase):
+    _MESSAGE = 'Unknown receptor ctl error'
+
+    def __init__(self, msg, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._MESSAGE = msg
+
+
+class FuzzyError:
+    def __new__(self, e: RuntimeError, node: str, state_name: str):
+        """
+        At the time of writing this comment all of the sub-classes detection
+        is centralized in this parent class. It's like a Router().
+        Someone may find it better to push down the error detection logic into
+        each sub-class.
+        """
+        msg = e.args[0]
+
+        common_startswith = (WorkUnitCancelError, WorkUnitResultsError, WorkUnitError)
+
+        for klass in common_startswith:
+            if msg.startswith(klass._MESSAGE):
+                work_unit_id = msg[len(klass._MESSAGE) :]
+                return klass(work_unit_id, node=node, state_name=state_name)
+
+        return UnknownError(msg, node=node, state_name=state_name)
+
+
+def read_receptor_config():
+    # for K8S deployments, getting a lock is necessary as another process
+    # may be re-writing the config at this time
+    if settings.IS_K8S:
+        lock = FileLock(__RECEPTOR_CONF_LOCKFILE)
+        with lock:
+            with open(__RECEPTOR_CONF, 'r') as f:
+                return yaml.safe_load(f)
+    else:
+        with open(__RECEPTOR_CONF, 'r') as f:
+            return yaml.safe_load(f)
+
+
+def work_signing_enabled(config_data):
+    for section in config_data:
+        if 'work-signing' in section:
+            return True
+    return False
+
+
+def get_receptor_sockfile(config_data):
+    for section in config_data:
         for entry_name, entry_data in section.items():
             if entry_name == 'control-service':
                 if 'filename' in entry_data:
@@ -55,13 +149,11 @@ def get_receptor_sockfile():
         raise RuntimeError(f'Receptor conf {__RECEPTOR_CONF} does not have control-service entry needed to get sockfile')
 
 
-def get_tls_client(use_stream_tls=None):
+def get_tls_client(config_data, use_stream_tls=None):
     if not use_stream_tls:
         return None
 
-    with open(__RECEPTOR_CONF, 'r') as f:
-        data = yaml.safe_load(f)
-    for section in data:
+    for section in config_data:
         for entry_name, entry_data in section.items():
             if entry_name == 'tls-client':
                 if 'name' in entry_data:
@@ -69,20 +161,35 @@ def get_tls_client(use_stream_tls=None):
     return None
 
 
-def get_receptor_ctl():
-    receptor_sockfile = get_receptor_sockfile()
+def get_receptor_ctl(config_data=None):
+    if config_data is None:
+        config_data = read_receptor_config()
+    receptor_sockfile = get_receptor_sockfile(config_data)
     try:
-        return ReceptorControl(receptor_sockfile, config=__RECEPTOR_CONF, tlsclient=get_tls_client(True))
+        return ReceptorControl(receptor_sockfile, config=__RECEPTOR_CONF, tlsclient=get_tls_client(config_data, True))
     except RuntimeError:
         return ReceptorControl(receptor_sockfile)
 
 
+def find_node_in_mesh(node_name, receptor_ctl):
+    attempts = 10
+    backoff = 1
+    for attempt in range(attempts):
+        all_nodes = receptor_ctl.simple_command("status").get('Advertisements', None)
+        for node in all_nodes:
+            if node.get('NodeID') == node_name:
+                return node
+        else:
+            logger.warning(f"Instance {node_name} is not in the receptor mesh. {attempts-attempt} attempts left.")
+            time.sleep(backoff)
+            backoff += 1
+    else:
+        raise ReceptorNodeNotFound(f'Instance {node_name} is not in the receptor mesh')
+
+
 def get_conn_type(node_name, receptor_ctl):
-    all_nodes = receptor_ctl.simple_command("status").get('Advertisements', None)
-    for node in all_nodes:
-        if node.get('NodeID') == node_name:
-            return ReceptorConnectionType(node.get('ConnType'))
-    raise ReceptorNodeNotFound(f'Instance {node_name} is not in the receptor mesh')
+    node = find_node_in_mesh(node_name, receptor_ctl)
+    return ReceptorConnectionType(node.get('ConnType'))
 
 
 def administrative_workunit_reaper(work_list=None):
@@ -100,16 +207,22 @@ def administrative_workunit_reaper(work_list=None):
 
     for unit_id, work_data in work_list.items():
         extra_data = work_data.get('ExtraData')
-        if (extra_data is None) or (extra_data.get('RemoteWorkType') != 'ansible-runner'):
+        if extra_data is None:
             continue  # if this is not ansible-runner work, we do not want to touch it
-        params = extra_data.get('RemoteParams', {}).get('params')
-        if not params:
-            continue
-        if not (params == '--worker-info' or params.startswith('cleanup')):
-            continue  # if this is not a cleanup or health check, we do not want to touch it
-        if work_data.get('StateName') in RECEPTOR_ACTIVE_STATES:
-            continue  # do not want to touch active work units
-        logger.info(f'Reaping orphaned work unit {unit_id} with params {params}')
+        if isinstance(extra_data, str):
+            if not work_data.get('StateName', None) or work_data.get('StateName') in RECEPTOR_ACTIVE_STATES:
+                continue
+        else:
+            if extra_data.get('RemoteWorkType') != 'ansible-runner':
+                continue
+            params = extra_data.get('RemoteParams', {}).get('params')
+            if not params:
+                continue
+            if not (params == '--worker-info' or params.startswith('cleanup')):
+                continue  # if this is not a cleanup or health check, we do not want to touch it
+            if work_data.get('StateName') in RECEPTOR_ACTIVE_STATES:
+                continue  # do not want to touch active work units
+            logger.info(f'Reaping orphaned work unit {unit_id} with params {params}')
         receptor_ctl.simple_command(f"work release {unit_id}")
 
 
@@ -117,20 +230,24 @@ class RemoteJobError(RuntimeError):
     pass
 
 
-def run_until_complete(node, timing_data=None, **kwargs):
+def run_until_complete(node, timing_data=None, worktype='ansible-runner', ttl='20s', **kwargs):
     """
     Runs an ansible-runner work_type on remote node, waits until it completes, then returns stdout.
     """
-    receptor_ctl = get_receptor_ctl()
+
+    config_data = read_receptor_config()
+    receptor_ctl = get_receptor_ctl(config_data)
 
     use_stream_tls = getattr(get_conn_type(node, receptor_ctl), 'name', None) == "STREAMTLS"
-    kwargs.setdefault('tlsclient', get_tls_client(use_stream_tls))
-    kwargs.setdefault('ttl', '20s')
+    kwargs.setdefault('tlsclient', get_tls_client(config_data, use_stream_tls))
+    if ttl is not None:
+        kwargs['ttl'] = ttl
     kwargs.setdefault('payload', '')
+    if work_signing_enabled(config_data):
+        kwargs['signwork'] = True
 
     transmit_start = time.time()
-    sign_work = False if settings.IS_K8S else True
-    result = receptor_ctl.submit_work(worktype='ansible-runner', node=node, signwork=sign_work, **kwargs)
+    result = receptor_ctl.submit_work(worktype=worktype, node=node, **kwargs)
 
     unit_id = result['unitid']
     run_start = time.time()
@@ -138,9 +255,9 @@ def run_until_complete(node, timing_data=None, **kwargs):
         timing_data['transmit_timing'] = run_start - transmit_start
     run_timing = 0.0
     stdout = ''
+    state_name = 'local var never set'
 
     try:
-
         resultfile = receptor_ctl.get_work_results(unit_id)
 
         while run_timing < 20.0:
@@ -159,19 +276,41 @@ def run_until_complete(node, timing_data=None, **kwargs):
         stdout = resultfile.read()
         stdout = str(stdout, encoding='utf-8')
 
+    except RuntimeError as e:
+        receptor_e = FuzzyError(e, node, state_name)
+        if type(receptor_e) in (
+            WorkUnitError,
+            WorkUnitResultsError,
+        ):
+            logger.warning(f'While consuming job results: {receptor_e}')
+        else:
+            raise
     finally:
-
         if settings.RECEPTOR_RELEASE_WORK:
-            res = receptor_ctl.simple_command(f"work release {unit_id}")
-            if res != {'released': unit_id}:
-                logger.warning(f'Could not confirm release of receptor work unit id {unit_id} from {node}, data: {res}')
+            try:
+                res = receptor_ctl.simple_command(f"work release {unit_id}")
 
-        receptor_ctl.close()
+                if res != {'released': unit_id}:
+                    logger.warning(f'Could not confirm release of receptor work unit id {unit_id} from {node}, data: {res}')
+
+                receptor_ctl.close()
+            except RuntimeError as e:
+                receptor_e = FuzzyError(e, node, state_name)
+                if type(receptor_e) in (
+                    WorkUnitError,
+                    WorkUnitCancelError,
+                ):
+                    logger.warning(f"While releasing work: {receptor_e}")
+                else:
+                    logger.error(f"While releasing work: {receptor_e}")
 
     if state_name.lower() == 'failed':
         work_detail = status.get('Detail', '')
         if work_detail:
-            raise RemoteJobError(f'Receptor error from {node}, detail:\n{work_detail}')
+            if stdout:
+                raise RemoteJobError(f'Receptor error from {node}, detail:\n{work_detail}\nstdout:\n{stdout}')
+            else:
+                raise RemoteJobError(f'Receptor error from {node}, detail:\n{work_detail}')
         else:
             raise RemoteJobError(f'Unknown ansible-runner error on node {node}, stdout:\n{stdout}')
 
@@ -205,7 +344,7 @@ def worker_info(node_name, work_type='ansible-runner'):
         else:
             error_list.append(details)
 
-    except (ReceptorNodeNotFound, RuntimeError) as exc:
+    except Exception as exc:
         error_list.append(str(exc))
 
     # If we have a connection error, missing keys would be trivial consequence of that
@@ -227,7 +366,7 @@ def _convert_args_to_cli(vargs):
     args = ['cleanup']
     for option in ('exclude_strings', 'remove_images'):
         if vargs.get(option):
-            args.append('--{}={}'.format(option.replace('_', '-'), ' '.join(vargs.get(option))))
+            args.append('--{} {}'.format(option.replace('_', '-'), ' '.join(f'"{item}"' for item in vargs.get(option))))
     for option in ('file_pattern', 'image_prune', 'process_isolation_executable', 'grace_period'):
         if vargs.get(option) is True:
             args.append('--{}'.format(option.replace('_', '-')))
@@ -236,7 +375,7 @@ def _convert_args_to_cli(vargs):
     return args
 
 
-def worker_cleanup(node_name, vargs, timeout=300.0):
+def worker_cleanup(node_name, vargs):
     args = _convert_args_to_cli(vargs)
 
     remote_command = ' '.join(args)
@@ -262,23 +401,48 @@ class AWXReceptorJob:
 
     def run(self):
         # We establish a connection to the Receptor socket
-        receptor_ctl = get_receptor_ctl()
+        self.config_data = read_receptor_config()
+        receptor_ctl = get_receptor_ctl(self.config_data)
 
         res = None
         try:
             res = self._run_internal(receptor_ctl)
             return res
         finally:
-            # Make sure to always release the work unit if we established it
-            if self.unit_id is not None and settings.RECEPTOR_RELEASE_WORK:
-                try:
-                    receptor_ctl.simple_command(f"work release {self.unit_id}")
-                except Exception:
-                    logger.exception(f"Error releasing work unit {self.unit_id}.")
+            status = getattr(res, 'status', 'error')
+            self._receptor_release_work(receptor_ctl, status)
 
-    @property
-    def sign_work(self):
-        return False if settings.IS_K8S else True
+    def _receptor_release_work(self, receptor_ctl: ReceptorControl, status: str) -> None:
+        """
+        Releases the work unit from Receptor if certain conditions are met.
+        This method checks several conditions before attempting to release the work unit:
+        - If `self.unit_id` is `None`, the method returns immediately.
+        - If the `RECEPTOR_RELEASE_WORK` setting is `False`, the method returns immediately.
+        - If the `RECEPTOR_KEEP_WORK_ON_ERROR` setting is `True` and the status is 'error', the method returns immediately.
+        If none of the above conditions are met, the method attempts to release the work unit using the Receptor control command.
+        If an exception occurs during the release process, it logs an error message.
+        Args:
+            receptor_ctl (ReceptorControl): The Receptor control object used to issue commands.
+            status (str): The status of the work unit, which may affect whether it is released.
+        """
+
+        if self.unit_id is None:
+            logger.debug("No work unit ID to release.")
+            return
+
+        if settings.RECEPTOR_RELEASE_WORK is False:
+            logger.debug(f"RECEPTOR_RELEASE_WORK is False, not releasing work unit {self.unit_id}.")
+            return
+
+        if settings.RECEPTOR_KEEP_WORK_ON_ERROR and status == 'error':
+            logger.debug(f"RECEPTOR_KEEP_WORK_ON_ERROR is True and status is 'error', not releasing work unit {self.unit_id}.")
+            return
+
+        try:
+            logger.debug(f"Released work unit {self.unit_id}.")
+            receptor_ctl.simple_command(f"work release {self.unit_id}")
+        except Exception:
+            logger.exception(f"Error releasing work unit {self.unit_id}.")
 
     def _run_internal(self, receptor_ctl):
         # Create a socketpair. Where the left side will be used for writing our payload
@@ -291,7 +455,7 @@ class AWXReceptorJob:
         if self.work_type == 'ansible-runner':
             work_submit_kw['node'] = self.task.instance.execution_node
             use_stream_tls = get_conn_type(work_submit_kw['node'], receptor_ctl).name == "STREAMTLS"
-            work_submit_kw['tlsclient'] = get_tls_client(use_stream_tls)
+            work_submit_kw['tlsclient'] = get_tls_client(self.config_data, use_stream_tls)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             transmitter_future = executor.submit(self.transmit, sockin)
@@ -330,31 +494,46 @@ class AWXReceptorJob:
             shutil.rmtree(artifact_dir)
 
         resultsock, resultfile = receptor_ctl.get_work_results(self.unit_id, return_socket=True, return_sockfile=True)
-        # Both "processor" and "cancel_watcher" are spawned in separate threads.
-        # We wait for the first one to return. If cancel_watcher returns first,
-        # we yank the socket out from underneath the processor, which will cause it
-        # to exit. A reference to the processor_future is passed into the cancel_watcher_future,
-        # Which exits if the job has finished normally. The context manager ensures we do not
-        # leave any threads laying around.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            processor_future = executor.submit(self.processor, resultfile)
-            cancel_watcher_future = executor.submit(self.cancel_watcher, processor_future)
-            futures = [processor_future, cancel_watcher_future]
-            first_future = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
 
-            res = list(first_future.done)[0].result()
-            if res.status == 'canceled':
+        connections.close_all()
+
+        # "processor" and the main thread will be separate threads.
+        # If a cancel happens, the main thread will encounter an exception, in which case
+        # we yank the socket out from underneath the processor, which will cause it to exit.
+        # The ThreadPoolExecutor context manager ensures we do not leave any threads laying around.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            processor_future = executor.submit(self.processor, resultfile)
+
+            try:
+                signal_state.raise_exception = True
+                # address race condition where SIGTERM was issued after this dispatcher task started
+                if signal_callback():
+                    raise SignalExit()
+                res = processor_future.result()
+            except SignalExit:
                 receptor_ctl.simple_command(f"work cancel {self.unit_id}")
                 resultsock.shutdown(socket.SHUT_RDWR)
                 resultfile.close()
-            elif res.status == 'error':
+                result = namedtuple('result', ['status', 'rc'])
+                res = result('canceled', 1)
+            finally:
+                signal_state.raise_exception = False
+
+            if res.status == 'error':
+                # If ansible-runner ran, but an error occured at runtime, the traceback information
+                # is saved via the status_handler passed in to the processor.
+                if 'result_traceback' in self.task.runner_callback.extra_update_fields:
+                    return res
+
                 try:
                     unit_status = receptor_ctl.simple_command(f'work status {self.unit_id}')
                     detail = unit_status.get('Detail', None)
                     state_name = unit_status.get('StateName', None)
+                    stdout_size = unit_status.get('StdoutSize', 0)
                 except Exception:
                     detail = ''
                     state_name = ''
+                    stdout_size = 0
                     logger.exception(f'An error was encountered while getting status for work unit {self.unit_id}')
 
                 if 'exceeded quota' in detail:
@@ -363,26 +542,26 @@ class AWXReceptorJob:
                     logger.warning(f"Could not launch pod for {log_name}. Exceeded quota.")
                     self.task.update_model(self.task.instance.pk, status='pending')
                     return
-                # If ansible-runner ran, but an error occured at runtime, the traceback information
-                # is saved via the status_handler passed in to the processor.
-                if state_name == 'Succeeded':
-                    return res
 
-                if not self.task.instance.result_traceback:
-                    try:
-                        resultsock = receptor_ctl.get_work_results(self.unit_id, return_sockfile=True)
-                        lines = resultsock.readlines()
+                try:
+                    receptor_output = ''
+                    if state_name == 'Failed' and self.task.runner_callback.event_ct == 0:
+                        # if receptor work unit failed and no events were emitted, work results may
+                        # contain useful information about why the job failed. In case stdout is
+                        # massive, only ask for last 1000 bytes
+                        startpos = max(stdout_size - 1000, 0)
+                        resultsock, resultfile = receptor_ctl.get_work_results(self.unit_id, startpos=startpos, return_socket=True, return_sockfile=True)
+                        lines = resultfile.readlines()
                         receptor_output = b"".join(lines).decode()
-                        if receptor_output:
-                            self.task.instance.result_traceback = receptor_output
-                            self.task.instance.save(update_fields=['result_traceback'])
-                        elif detail:
-                            self.task.instance.result_traceback = detail
-                            self.task.instance.save(update_fields=['result_traceback'])
-                        else:
-                            logger.warning(f'No result details or output from {self.task.instance.log_format}, status:\n{state_name}')
-                    except Exception:
-                        raise RuntimeError(detail)
+                    if receptor_output:
+                        self.task.runner_callback.delay_update(result_traceback=f'Worker output:\n{receptor_output}')
+                    elif detail:
+                        self.task.runner_callback.delay_update(result_traceback=f'Receptor detail:\n{detail}')
+                    else:
+                        logger.warning(f'No result details or output from {self.task.instance.log_format}, status:\n{state_name}')
+                except Exception:
+                    logger.exception(f'Work results error from job id={self.task.instance.id} work_unit={self.task.instance.work_unit_id}')
+                    raise RuntimeError(detail)
 
         return res
 
@@ -405,6 +584,7 @@ class AWXReceptorJob:
             event_handler=self.task.runner_callback.event_handler,
             finished_callback=self.task.runner_callback.finished_callback,
             status_handler=self.task.runner_callback.status_handler,
+            artifacts_handler=self.task.runner_callback.artifacts_handler,
             **self.runner_params,
         )
 
@@ -434,6 +614,12 @@ class AWXReceptorJob:
         return receptor_params
 
     @property
+    def sign_work(self):
+        if self.work_type in ('ansible-runner', 'local'):
+            return work_signing_enabled(self.config_data)
+        return False
+
+    @property
     def work_type(self):
         if self.task.instance.is_container_group_task:
             if self.credential:
@@ -442,18 +628,6 @@ class AWXReceptorJob:
         if self.task.instance.execution_node == settings.CLUSTER_HOST_ID or self.task.instance.execution_node == self.task.instance.controller_node:
             return 'local'
         return 'ansible-runner'
-
-    @cleanup_new_process
-    def cancel_watcher(self, processor_future):
-        while True:
-            if processor_future.done():
-                return processor_future.result()
-
-            if self.task.runner_callback.cancel_callback():
-                result = namedtuple('result', ['status', 'rc'])
-                return result('canceled', 1)
-
-            time.sleep(1)
 
     @property
     def pod_definition(self):
@@ -472,6 +646,10 @@ class AWXReceptorJob:
 
         pod_spec['spec']['containers'][0]['image'] = ee.image
         pod_spec['spec']['containers'][0]['args'] = ['ansible-runner', 'worker', '--private-data-dir=/runner']
+
+        if settings.AWX_RUNNER_KEEPALIVE_SECONDS:
+            pod_spec['spec']['containers'][0].setdefault('env', [])
+            pod_spec['spec']['containers'][0]['env'].append({'name': 'ANSIBLE_RUNNER_KEEPALIVE_SECONDS', 'value': str(settings.AWX_RUNNER_KEEPALIVE_SECONDS)})
 
         # Enforce EE Pull Policy
         pull_options = {"always": "Always", "missing": "IfNotPresent", "never": "Never"}
@@ -573,3 +751,146 @@ class AWXReceptorJob:
         else:
             config["clusters"][0]["cluster"]["insecure-skip-tls-verify"] = True
         return config
+
+
+# TODO: receptor reload expects ordering within config items to be preserved
+# if python dictionary is not preserving order properly, may need to find a
+# solution. yaml.dump does not seem to work well with OrderedDict. below line may help
+# yaml.add_representer(OrderedDict, lambda dumper, data: dumper.represent_mapping('tag:yaml.org,2002:map', data.items()))
+#
+RECEPTOR_CONFIG_STARTER = (
+    {'local-only': None},
+    {'log-level': settings.RECEPTOR_LOG_LEVEL},
+    {'node': {'firewallrules': [{'action': 'reject', 'tonode': settings.CLUSTER_HOST_ID, 'toservice': 'control'}]}},
+    {'control-service': {'service': 'control', 'filename': '/var/run/receptor/receptor.sock', 'permissions': '0660'}},
+    {'work-command': {'worktype': 'local', 'command': 'ansible-runner', 'params': 'worker', 'allowruntimeparams': True}},
+    {'work-signing': {'privatekey': '/etc/receptor/work_private_key.pem', 'tokenexpiration': '1m'}},
+    {
+        'work-kubernetes': {
+            'worktype': 'kubernetes-runtime-auth',
+            'authmethod': 'runtime',
+            'allowruntimeauth': True,
+            'allowruntimepod': True,
+            'allowruntimeparams': True,
+        }
+    },
+    {
+        'work-kubernetes': {
+            'worktype': 'kubernetes-incluster-auth',
+            'authmethod': 'incluster',
+            'allowruntimeauth': True,
+            'allowruntimepod': True,
+            'allowruntimeparams': True,
+        }
+    },
+    {
+        'tls-client': {
+            'name': 'tlsclient',
+            'rootcas': '/etc/receptor/tls/ca/mesh-CA.crt',
+            'cert': '/etc/receptor/tls/receptor.crt',
+            'key': '/etc/receptor/tls/receptor.key',
+            'mintls13': False,
+        }
+    },
+)
+
+
+def should_update_config(new_config):
+    '''
+    checks that the list of instances matches the list of
+    tcp-peers in the config
+    '''
+
+    current_config = read_receptor_config()  # this gets receptor conf lock
+    for config_entry in current_config:
+        if config_entry not in new_config:
+            logger.warning(f"{config_entry} should not be in receptor config. Updating.")
+            return True
+    for config_entry in new_config:
+        if config_entry not in current_config:
+            logger.warning(f"{config_entry} missing from receptor config. Updating.")
+            return True
+
+    return False
+
+
+def generate_config_data():
+    # returns two values
+    #   receptor config - based on current database peers
+    #   should_update   - If True, receptor_config differs from the receptor conf file on disk
+    addresses = ReceptorAddress.objects.filter(peers_from_control_nodes=True)
+
+    receptor_config = list(RECEPTOR_CONFIG_STARTER)
+    for address in addresses:
+        if address.get_peer_type():
+            peer = {
+                f'{address.get_peer_type()}': {
+                    'address': f'{address.get_full_address()}',
+                    'tls': 'tlsclient',
+                }
+            }
+            receptor_config.append(peer)
+        else:
+            logger.warning(f"Receptor address {address} has unsupported peer type, skipping.")
+    should_update = should_update_config(receptor_config)
+    return receptor_config, should_update
+
+
+def reload_receptor():
+    logger.warning("Receptor config changed, reloading receptor")
+
+    # This needs to be outside of the lock because this function itself will acquire the lock.
+    receptor_ctl = get_receptor_ctl()
+
+    attempts = 10
+    for backoff in range(1, attempts + 1):
+        try:
+            receptor_ctl.simple_command("reload")
+            break
+        except ValueError:
+            logger.warning(f"Unable to reload Receptor configuration. {attempts-backoff} attempts left.")
+            time.sleep(backoff)
+    else:
+        raise RuntimeError("Receptor reload failed")
+
+
+@task(on_duplicate='queue_one')
+def write_receptor_config():
+    """
+    This task runs async on each control node, K8S only.
+    It is triggered whenever remote is added or removed, or if peers_from_control_nodes
+    is flipped.
+    It is possible for write_receptor_config to be called multiple times.
+    For example, if new instances are added in quick succession.
+    To prevent that case, each control node first grabs a DB advisory lock, specific
+    to just that control node (i.e. multiple control nodes can run this function
+    at the same time, since it only writes the local receptor config file)
+    """
+    with advisory_lock(f"{settings.CLUSTER_HOST_ID}_write_receptor_config", wait=True):
+        # Config file needs to be updated
+        receptor_config, should_update = generate_config_data()
+        if should_update:
+            lock = FileLock(__RECEPTOR_CONF_LOCKFILE)
+            with lock:
+                with open(__RECEPTOR_CONF, 'w') as file:
+                    yaml.dump(receptor_config, file, default_flow_style=False)
+            reload_receptor()
+
+
+@task(queue=get_task_queuename, on_duplicate='discard')
+def remove_deprovisioned_node(hostname):
+    InstanceLink.objects.filter(source__hostname=hostname).update(link_state=InstanceLink.States.REMOVING)
+    InstanceLink.objects.filter(target__instance__hostname=hostname).update(link_state=InstanceLink.States.REMOVING)
+
+    node_jobs = UnifiedJob.objects.filter(
+        execution_node=hostname,
+        status__in=(
+            'running',
+            'waiting',
+        ),
+    )
+    while node_jobs.exists():
+        time.sleep(60)
+
+    # This will as a side effect also delete the InstanceLinks that are tied to it.
+    Instance.objects.filter(hostname=hostname).delete()

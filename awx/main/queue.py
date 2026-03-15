@@ -4,11 +4,12 @@
 # Python
 import json
 import logging
-import redis
 
 # Django
 from django.conf import settings
-import awx.main.analytics.subsystem_metrics as s_metrics
+
+# AWX
+from awx.main.utils.redis import get_redis_client
 
 __all__ = ['CallbackQueueDispatcher']
 
@@ -27,8 +28,7 @@ class CallbackQueueDispatcher(object):
     def __init__(self):
         self.queue = getattr(settings, 'CALLBACK_QUEUE', '')
         self.logger = logging.getLogger('awx.main.queue.CallbackQueueDispatcher')
-        self.connection = redis.Redis.from_url(settings.BROKER_URL)
-        self.subsystem_metrics = s_metrics.Metrics()
+        self.connection = get_redis_client()
 
     def dispatch(self, obj):
         self.connection.rpush(self.queue, json.dumps(obj, cls=AnsibleJSONEncoder))

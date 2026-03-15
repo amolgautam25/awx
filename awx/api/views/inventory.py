@@ -14,11 +14,12 @@ from django.utils.translation import gettext_lazy as _
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework import status
+from rest_framework import serializers
 
 # AWX
 from awx.main.models import ActivityStream, Inventory, JobTemplate, Role, User, InstanceGroup, InventoryUpdateEvent, InventoryUpdate
 
-from awx.main.models.label import Label
+from ansible_base.lib.utils.schema import extend_schema_if_available
 
 from awx.api.generics import (
     ListCreateAPIView,
@@ -27,30 +28,27 @@ from awx.api.generics import (
     SubListAttachDetachAPIView,
     ResourceAccessList,
     CopyAPIView,
-    DeleteLastUnattachLabelMixin,
-    SubListCreateAttachDetachAPIView,
 )
+from awx.api.views.labels import LabelSubListCreateAttachDetachView
 
 
 from awx.api.serializers import (
     InventorySerializer,
+    ConstructedInventorySerializer,
     ActivityStreamSerializer,
     RoleSerializer,
     InstanceGroupSerializer,
     InventoryUpdateEventSerializer,
     JobTemplateSerializer,
-    LabelSerializer,
 )
-from awx.api.views.mixin import RelatedJobsPreventDeleteMixin, ControlledByScmMixin
+from awx.api.views.mixin import RelatedJobsPreventDeleteMixin
 
 from awx.api.pagination import UnifiedJobEventPagination
-
 
 logger = logging.getLogger('awx.api.views.organization')
 
 
 class InventoryUpdateEventsList(SubListAPIView):
-
     model = InventoryUpdateEvent
     serializer_class = InventoryUpdateEventSerializer
     parent_model = InventoryUpdate
@@ -58,6 +56,7 @@ class InventoryUpdateEventsList(SubListAPIView):
     name = _('Inventory Update Events List')
     search_fields = ('stdout',)
     pagination_class = UnifiedJobEventPagination
+    resource_purpose = 'events of an inventory update'
 
     def get_queryset(self):
         iu = self.get_parent_object()
@@ -70,15 +69,19 @@ class InventoryUpdateEventsList(SubListAPIView):
 
 
 class InventoryList(ListCreateAPIView):
-
     model = Inventory
     serializer_class = InventorySerializer
+    resource_purpose = 'inventories'
+
+    @extend_schema_if_available(extensions={"x-ai-description": "A list of inventories."})
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
 
 
-class InventoryDetail(RelatedJobsPreventDeleteMixin, ControlledByScmMixin, RetrieveUpdateDestroyAPIView):
-
+class InventoryDetail(RelatedJobsPreventDeleteMixin, RetrieveUpdateDestroyAPIView):
     model = Inventory
     serializer_class = InventorySerializer
+    resource_purpose = 'inventory detail'
 
     def update(self, request, *args, **kwargs):
         obj = self.get_object()
@@ -86,7 +89,9 @@ class InventoryDetail(RelatedJobsPreventDeleteMixin, ControlledByScmMixin, Retri
 
         # Do not allow changes to an Inventory kind.
         if kind is not None and obj.kind != kind:
-            return Response(dict(error=_('You cannot turn a regular inventory into a "smart" inventory.')), status=status.HTTP_405_METHOD_NOT_ALLOWED)
+            return Response(
+                dict(error=_('You cannot turn a regular inventory into a "smart" or "constructed" inventory.')), status=status.HTTP_405_METHOD_NOT_ALLOWED
+            )
         return super(InventoryDetail, self).update(request, *args, **kwargs)
 
     def destroy(self, request, *args, **kwargs):
@@ -101,13 +106,41 @@ class InventoryDetail(RelatedJobsPreventDeleteMixin, ControlledByScmMixin, Retri
             return Response(dict(error=_("{0}".format(e))), status=status.HTTP_400_BAD_REQUEST)
 
 
-class InventoryActivityStreamList(SubListAPIView):
+class ConstructedInventoryDetail(InventoryDetail):
+    serializer_class = ConstructedInventorySerializer
+    resource_purpose = 'constructed inventory detail'
 
+
+class ConstructedInventoryList(InventoryList):
+    serializer_class = ConstructedInventorySerializer
+    resource_purpose = 'constructed inventories'
+
+    def get_queryset(self):
+        r = super().get_queryset()
+        return r.filter(kind='constructed')
+
+
+@extend_schema_if_available(extensions={"x-ai-description": "Get or create input inventory inventory"})
+class InventoryInputInventoriesList(SubListAttachDetachAPIView):
+    model = Inventory
+    serializer_class = InventorySerializer
+    parent_model = Inventory
+    relationship = 'input_inventories'
+    resource_purpose = 'input inventories of a constructed inventory'
+
+    def is_valid_relation(self, parent, sub, created=False):
+        if sub.kind == 'constructed':
+            raise serializers.ValidationError({'error': 'You cannot add a constructed inventory to another constructed inventory.'})
+
+
+@extend_schema_if_available(extensions={"x-ai-description": "Get activity stream for an inventory"})
+class InventoryActivityStreamList(SubListAPIView):
     model = ActivityStream
     serializer_class = ActivityStreamSerializer
     parent_model = Inventory
     relationship = 'activitystream_set'
     search_fields = ('changes',)
+    resource_purpose = 'activity stream for an inventory'
 
     def get_queryset(self):
         parent = self.get_parent_object()
@@ -117,25 +150,26 @@ class InventoryActivityStreamList(SubListAPIView):
 
 
 class InventoryInstanceGroupsList(SubListAttachDetachAPIView):
-
     model = InstanceGroup
     serializer_class = InstanceGroupSerializer
     parent_model = Inventory
     relationship = 'instance_groups'
+    resource_purpose = 'instance groups of an inventory'
 
 
 class InventoryAccessList(ResourceAccessList):
-
     model = User  # needs to be User for AccessLists's
     parent_model = Inventory
+    resource_purpose = 'users who can access the inventory'
 
 
 class InventoryObjectRolesList(SubListAPIView):
-
     model = Role
     serializer_class = RoleSerializer
     parent_model = Inventory
     search_fields = ('role_field', 'content_type__model')
+    deprecated = True
+    resource_purpose = 'roles of an inventory'
 
     def get_queryset(self):
         po = self.get_parent_object()
@@ -144,11 +178,11 @@ class InventoryObjectRolesList(SubListAPIView):
 
 
 class InventoryJobTemplateList(SubListAPIView):
-
     model = JobTemplate
     serializer_class = JobTemplateSerializer
     parent_model = Inventory
     relationship = 'jobtemplates'
+    resource_purpose = 'job templates using an inventory'
 
     def get_queryset(self):
         parent = self.get_parent_object()
@@ -157,31 +191,12 @@ class InventoryJobTemplateList(SubListAPIView):
         return qs.filter(inventory=parent)
 
 
-class InventoryLabelList(DeleteLastUnattachLabelMixin, SubListCreateAttachDetachAPIView, SubListAPIView):
-
-    model = Label
-    serializer_class = LabelSerializer
+class InventoryLabelList(LabelSubListCreateAttachDetachView):
     parent_model = Inventory
-    relationship = 'labels'
-
-    def post(self, request, *args, **kwargs):
-        # If a label already exists in the database, attach it instead of erroring out
-        # that it already exists
-        if 'id' not in request.data and 'name' in request.data and 'organization' in request.data:
-            existing = Label.objects.filter(name=request.data['name'], organization_id=request.data['organization'])
-            if existing.exists():
-                existing = existing[0]
-                request.data['id'] = existing.id
-                del request.data['name']
-                del request.data['organization']
-        if Label.objects.filter(inventory_labels=self.kwargs['pk']).count() > 100:
-            return Response(
-                dict(msg=_('Maximum number of labels for {} reached.'.format(self.parent_model._meta.verbose_name_raw))), status=status.HTTP_400_BAD_REQUEST
-            )
-        return super(InventoryLabelList, self).post(request, *args, **kwargs)
+    resource_purpose = 'labels of an inventory'
 
 
 class InventoryCopy(CopyAPIView):
-
     model = Inventory
     copy_return_serializer_class = InventorySerializer
+    resource_purpose = 'copy of an inventory'

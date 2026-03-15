@@ -5,6 +5,7 @@
 import copy
 import json
 import re
+import sys
 import urllib.parse
 
 from jinja2 import sandbox, StrictUndefined
@@ -13,21 +14,14 @@ from jinja2.exceptions import UndefinedError, TemplateSyntaxError, SecurityError
 # Django
 from django.core import exceptions as django_exceptions
 from django.core.serializers.json import DjangoJSONEncoder
-from django.db.models.signals import (
-    post_save,
-    post_delete,
-)
-from django.db.models.signals import m2m_changed
+from django.db.models.signals import m2m_changed, post_save
 from django.db import models
-from django.db.models.fields.related import lazy_related_operation
 from django.db.models.fields.related_descriptors import (
     ReverseOneToOneDescriptor,
     ForwardManyToOneDescriptor,
     ManyToManyDescriptor,
-    ReverseManyToOneDescriptor,
     create_forward_many_to_many_manager,
 )
-from django.utils.encoding import smart_str
 from django.db.models import JSONField
 from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _
@@ -46,14 +40,12 @@ from awx.main.validators import validate_ssh_private_key
 from awx.main.constants import ENV_BLOCKLIST
 from awx.main import utils
 
-
 __all__ = [
     'JSONBlob',
     'AutoOneToOneField',
     'ImplicitRoleField',
     'SmartFilterField',
     'OrderedManyToManyField',
-    'update_role_parentage_for_instance',
     'is_implicit_parent',
 ]
 
@@ -67,9 +59,59 @@ def __enum_validate__(validator, enums, instance, schema):
 Draft4Validator.VALIDATORS['enum'] = __enum_validate__
 
 
+import logging
+
+logger = logging.getLogger('awx.main.fields')
+
+
 class JSONBlob(JSONField):
+    # Cringe... a JSONField that is back ended with a TextField.
+    # This field was a legacy custom field type that tl;dr; was a TextField
+    # Over the years, with Django upgrades, we were able to go to a JSONField instead of the custom field
+    # However, we didn't want to have large customers with millions of events to update from text to json during an upgrade
+    # So we keep this field type as backended with TextField.
     def get_internal_type(self):
         return "TextField"
+
+    # postgres uses a Jsonb field as the default backend
+    # with psycopg2 it was using a psycopg2._json.Json class internally
+    # with psycopg3 it uses a psycopg.types.json.Jsonb class internally
+    # The binary class was not compatible with a text field, so we are going to override these next two methods and ensure we are using a string
+
+    def from_db_value(self, value, expression, connection):
+        if value is None:
+            return value
+
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except Exception as e:
+                logger.error(f"Failed to load JSONField {self.name}: {e}")
+
+        return value
+
+    def get_db_prep_value(self, value, connection, prepared=False):
+        if not prepared:
+            value = self.get_prep_value(value)
+        try:
+            # Null characters are not allowed in text fields and JSONBlobs are JSON data but saved as text
+            # So we want to make sure we strip out any null characters also note, these "should" be escaped by the dumps process:
+            #     >>> my_obj = { 'test': '\x00' }
+            #     >>> import json
+            #     >>> json.dumps(my_obj)
+            #     '{"test": "\\u0000"}'
+            # But just to be safe, lets remove them if they are there. \x00 and \u0000 are the same:
+            #     >>> string = "\x00"
+            #     >>> "\u0000" in string
+            #     True
+            dumped_value = json.dumps(value)
+            if "\x00" in dumped_value:
+                dumped_value = dumped_value.replace("\x00", '')
+            return dumped_value
+        except Exception as e:
+            logger.error(f"Failed to dump JSONField {self.name}: {e} value: {value}")
+
+        return value
 
 
 # Based on AutoOneToOneField from django-annoying:
@@ -93,34 +135,6 @@ class AutoOneToOneField(models.OneToOneField):
 
     def contribute_to_related_class(self, cls, related):
         setattr(cls, related.get_accessor_name(), AutoSingleRelatedObjectDescriptor(related))
-
-
-def resolve_role_field(obj, field):
-    ret = []
-
-    field_components = field.split('.', 1)
-    if hasattr(obj, field_components[0]):
-        obj = getattr(obj, field_components[0])
-    else:
-        return []
-
-    if obj is None:
-        return []
-
-    if len(field_components) == 1:
-        # use extremely generous duck typing to accomidate all possible forms
-        # of the model that may be used during various migrations
-        if obj._meta.model_name != 'role' or obj._meta.app_label != 'main':
-            raise Exception(smart_str('{} refers to a {}, not a Role'.format(field, type(obj))))
-        ret.append(obj.id)
-    else:
-        if type(obj) is ManyToManyDescriptor:
-            for o in obj.all():
-                ret += resolve_role_field(o, field_components[1])
-        else:
-            ret += resolve_role_field(obj, field_components[1])
-
-    return ret
 
 
 def is_implicit_parent(parent_role, child_role):
@@ -159,34 +173,6 @@ def is_implicit_parent(parent_role, child_role):
     return False
 
 
-def update_role_parentage_for_instance(instance):
-    """update_role_parentage_for_instance
-    updates the parents listing for all the roles
-    of a given instance if they have changed
-    """
-    parents_removed = set()
-    parents_added = set()
-    for implicit_role_field in getattr(instance.__class__, '__implicit_role_fields'):
-        cur_role = getattr(instance, implicit_role_field.name)
-        original_parents = set(json.loads(cur_role.implicit_parents))
-        new_parents = implicit_role_field._resolve_parent_roles(instance)
-        removals = original_parents - new_parents
-        if removals:
-            cur_role.parents.remove(*list(removals))
-            parents_removed.add(cur_role.pk)
-        additions = new_parents - original_parents
-        if additions:
-            cur_role.parents.add(*list(additions))
-            parents_added.add(cur_role.pk)
-        new_parents_list = list(new_parents)
-        new_parents_list.sort()
-        new_parents_json = json.dumps(new_parents_list)
-        if cur_role.implicit_parents != new_parents_json:
-            cur_role.implicit_parents = new_parents_json
-            cur_role.save(update_fields=['implicit_parents'])
-    return (parents_added, parents_removed)
-
-
 class ImplicitRoleDescriptor(ForwardManyToOneDescriptor):
     pass
 
@@ -201,7 +187,7 @@ class ImplicitRoleField(models.ForeignKey):
         kwargs.setdefault('related_name', '+')
         kwargs.setdefault('null', 'True')
         kwargs.setdefault('editable', False)
-        kwargs.setdefault('on_delete', models.CASCADE)
+        kwargs.setdefault('on_delete', models.SET_NULL)
         super(ImplicitRoleField, self).__init__(*args, **kwargs)
 
     def deconstruct(self):
@@ -218,67 +204,6 @@ class ImplicitRoleField(models.ForeignKey):
         getattr(cls, '__implicit_role_fields').append(self)
 
         post_save.connect(self._post_save, cls, True, dispatch_uid='implicit-role-post-save')
-        post_delete.connect(self._post_delete, cls, True, dispatch_uid='implicit-role-post-delete')
-
-        function = lambda local, related, field: self.bind_m2m_changed(field, related, local)
-        lazy_related_operation(function, cls, "self", field=self)
-
-    def bind_m2m_changed(self, _self, _role_class, cls):
-        if not self.parent_role:
-            return
-
-        field_names = self.parent_role
-        if type(field_names) is not list:
-            field_names = [field_names]
-
-        for field_name in field_names:
-
-            if field_name.startswith('singleton:'):
-                continue
-
-            field_name, sep, field_attr = field_name.partition('.')
-            # Non existent fields will occur if ever a parent model is
-            # moved inside a migration, needed for job_template_organization_field
-            # migration in particular
-            # consistency is assured by unit test awx.main.tests.functional
-            field = getattr(cls, field_name, None)
-
-            if field and type(field) is ReverseManyToOneDescriptor or type(field) is ManyToManyDescriptor:
-
-                if '.' in field_attr:
-                    raise Exception('Referencing deep roles through ManyToMany fields is unsupported.')
-
-                if type(field) is ReverseManyToOneDescriptor:
-                    sender = field.through
-                else:
-                    sender = field.related.through
-
-                reverse = type(field) is ManyToManyDescriptor
-                m2m_changed.connect(self.m2m_update(field_attr, reverse), sender, weak=False)
-
-    def m2m_update(self, field_attr, _reverse):
-        def _m2m_update(instance, action, model, pk_set, reverse, **kwargs):
-            if action == 'post_add' or action == 'pre_remove':
-                if _reverse:
-                    reverse = not reverse
-
-                if reverse:
-                    for pk in pk_set:
-                        obj = model.objects.get(pk=pk)
-                        if action == 'post_add':
-                            getattr(instance, field_attr).children.add(getattr(obj, self.name))
-                        if action == 'pre_remove':
-                            getattr(instance, field_attr).children.remove(getattr(obj, self.name))
-
-                else:
-                    for pk in pk_set:
-                        obj = model.objects.get(pk=pk)
-                        if action == 'post_add':
-                            getattr(instance, self.name).parents.add(getattr(obj, field_attr))
-                        if action == 'pre_remove':
-                            getattr(instance, self.name).parents.remove(getattr(obj, field_attr))
-
-        return _m2m_update
 
     def _post_save(self, instance, created, *args, **kwargs):
         Role_ = utils.get_current_apps().get_model('main', 'Role')
@@ -288,68 +213,24 @@ class ImplicitRoleField(models.ForeignKey):
         Model = utils.get_current_apps().get_model('main', instance.__class__.__name__)
         latest_instance = Model.objects.get(pk=instance.pk)
 
-        # Avoid circular import
-        from awx.main.models.rbac import batch_role_ancestor_rebuilding, Role
+        # Create any missing role objects
+        missing_roles = []
+        for implicit_role_field in getattr(latest_instance.__class__, '__implicit_role_fields'):
+            cur_role = getattr(latest_instance, implicit_role_field.name, None)
+            if cur_role is None:
+                missing_roles.append(Role_(role_field=implicit_role_field.name, content_type_id=ct_id, object_id=latest_instance.id))
 
-        with batch_role_ancestor_rebuilding():
-            # Create any missing role objects
-            missing_roles = []
-            for implicit_role_field in getattr(latest_instance.__class__, '__implicit_role_fields'):
-                cur_role = getattr(latest_instance, implicit_role_field.name, None)
-                if cur_role is None:
-                    missing_roles.append(Role_(role_field=implicit_role_field.name, content_type_id=ct_id, object_id=latest_instance.id))
+        if len(missing_roles) > 0:
+            Role_.objects.bulk_create(missing_roles)
+            updates = {}
+            role_ids = []
+            for role in Role_.objects.filter(content_type_id=ct_id, object_id=latest_instance.id):
+                setattr(latest_instance, role.role_field, role)
+                updates[role.role_field] = role.id
+                role_ids.append(role.id)
+            type(latest_instance).objects.filter(pk=latest_instance.pk).update(**updates)
 
-            if len(missing_roles) > 0:
-                Role_.objects.bulk_create(missing_roles)
-                updates = {}
-                role_ids = []
-                for role in Role_.objects.filter(content_type_id=ct_id, object_id=latest_instance.id):
-                    setattr(latest_instance, role.role_field, role)
-                    updates[role.role_field] = role.id
-                    role_ids.append(role.id)
-                type(latest_instance).objects.filter(pk=latest_instance.pk).update(**updates)
-                Role.rebuild_role_ancestor_list(role_ids, [])
-
-            update_role_parentage_for_instance(latest_instance)
-            instance.refresh_from_db()
-
-    def _resolve_parent_roles(self, instance):
-        if not self.parent_role:
-            return set()
-
-        paths = self.parent_role if type(self.parent_role) is list else [self.parent_role]
-        parent_roles = set()
-
-        for path in paths:
-            if path.startswith("singleton:"):
-                singleton_name = path[10:]
-                Role_ = utils.get_current_apps().get_model('main', 'Role')
-                qs = Role_.objects.filter(singleton_name=singleton_name)
-                if qs.count() >= 1:
-                    role = qs[0]
-                else:
-                    role = Role_.objects.create(singleton_name=singleton_name, role_field=singleton_name)
-                parents = [role.id]
-            else:
-                parents = resolve_role_field(instance, path)
-
-            for parent in parents:
-                parent_roles.add(parent)
-        return parent_roles
-
-    def _post_delete(self, instance, *args, **kwargs):
-        role_ids = []
-        for implicit_role_field in getattr(instance.__class__, '__implicit_role_fields'):
-            role_ids.append(getattr(instance, implicit_role_field.name + '_id'))
-
-        Role_ = utils.get_current_apps().get_model('main', 'Role')
-        child_ids = [x for x in Role_.parents.through.objects.filter(to_role_id__in=role_ids).distinct().values_list('from_role_id', flat=True)]
-        Role_.objects.filter(id__in=role_ids).delete()
-
-        # Avoid circular import
-        from awx.main.models.rbac import Role
-
-        Role.rebuild_role_ancestor_list([], child_ids)
+        instance.refresh_from_db()
 
 
 class SmartFilterField(models.TextField):
@@ -358,11 +239,13 @@ class SmartFilterField(models.TextField):
         # https://docs.python.org/2/library/stdtypes.html#truth-value-testing
         if not value:
             return None
-        value = urllib.parse.unquote(value)
-        try:
-            SmartFilter().query_from_string(value)
-        except RuntimeError as e:
-            raise models.base.ValidationError(e)
+        # avoid doing too much during migrations
+        if 'migrate' not in sys.argv:
+            value = urllib.parse.unquote(value)
+            try:
+                SmartFilter().query_from_string(value)
+            except RuntimeError as e:
+                raise models.base.ValidationError(e)
         return super(SmartFilterField, self).get_prep_value(value)
 
 
@@ -545,6 +428,9 @@ class CredentialInputField(JSONSchemaField):
         # determine the defined fields for the associated credential type
         properties = {}
         for field in model_instance.credential_type.inputs.get('fields', []):
+            # Prevent users from providing values for internally resolved fields
+            if 'internal' in field:
+                continue
             field = field.copy()
             properties[field['id']] = field
             if field.get('choices', []):
@@ -629,7 +515,6 @@ class CredentialInputField(JSONSchemaField):
         # `ssh_key_unlock` requirements are very specific and can't be
         # represented without complicated JSON schema
         if model_instance.credential_type.managed is True and 'ssh_key_unlock' in defined_fields:
-
             # in order to properly test the necessity of `ssh_key_unlock`, we
             # need to know the real value of `ssh_key_data`; for a payload like:
             # {
@@ -684,6 +569,7 @@ class CredentialTypeInputField(JSONSchemaField):
                             },
                             'label': {'type': 'string'},
                             'help_text': {'type': 'string'},
+                            'internal': {'type': 'boolean'},
                             'multiline': {'type': 'boolean'},
                             'secret': {'type': 'boolean'},
                             'ask_at_runtime': {'type': 'boolean'},
@@ -782,7 +668,7 @@ class CredentialTypeInjectorField(JSONSchemaField):
                             'type': 'string',
                             # The environment variable _value_ can be any ascii,
                             # but pexpect will choke on any unicode
-                            'pattern': '^[\x00-\x7F]*$',
+                            'pattern': '^[\x00-\x7f]*$',
                         },
                     },
                     'additionalProperties': False,
@@ -791,7 +677,8 @@ class CredentialTypeInjectorField(JSONSchemaField):
                     'type': 'object',
                     'patternProperties': {
                         # http://docs.ansible.com/ansible/playbooks_variables.html#what-makes-a-valid-variable-name
-                        '^[a-zA-Z_]+[a-zA-Z0-9_]*$': {'type': 'string'},
+                        # plus, add ability to template
+                        r'^[a-zA-Z_\{\}]+[a-zA-Z0-9_\{\}]*$': {"anyOf": [{'type': 'string'}, {'type': 'array'}, {'$ref': '#/properties/extra_vars'}]}
                     },
                     'additionalProperties': False,
                 },
@@ -802,7 +689,7 @@ class CredentialTypeInjectorField(JSONSchemaField):
     def validate_env_var_allowed(self, env_var):
         if env_var.startswith('ANSIBLE_'):
             raise django_exceptions.ValidationError(
-                _('Environment variable {} may affect Ansible configuration so its ' 'use is not allowed in credentials.').format(env_var),
+                _('Environment variable {} may affect Ansible configuration so its use is not allowed in credentials.').format(env_var),
                 code='invalid',
                 params={'value': env_var},
             )
@@ -858,27 +745,44 @@ class CredentialTypeInjectorField(JSONSchemaField):
                 template_name = template_name.split('.')[1]
                 setattr(valid_namespace['tower'].filename, template_name, 'EXAMPLE_FILENAME')
 
+        def validate_template_string(type_, key, tmpl):
+            try:
+                sandbox.ImmutableSandboxedEnvironment(undefined=StrictUndefined).from_string(tmpl).render(valid_namespace)
+            except UndefinedError as e:
+                raise django_exceptions.ValidationError(
+                    _('{sub_key} uses an undefined field ({error_msg})').format(sub_key=key, error_msg=e),
+                    code='invalid',
+                    params={'value': value},
+                )
+            except SecurityError as e:
+                raise django_exceptions.ValidationError(_('Encountered unsafe code execution: {}').format(e))
+            except TemplateSyntaxError as e:
+                raise django_exceptions.ValidationError(
+                    _('Syntax error rendering template for {sub_key} inside of {type} ({error_msg})').format(sub_key=key, type=type_, error_msg=e),
+                    code='invalid',
+                    params={'value': value},
+                )
+
+        def validate_extra_vars(key, node):
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    validate_template_string("extra_vars", 'a key' if key is None else key, k)
+                    validate_extra_vars(k if key is None else "{key}.{k}".format(key=key, k=k), v)
+            elif isinstance(node, list):
+                for i, x in enumerate(node):
+                    validate_extra_vars("{key}[{i}]".format(key=key, i=i), x)
+            else:
+                validate_template_string("extra_vars", key, node)
+
         for type_, injector in value.items():
             if type_ == 'env':
                 for key in injector.keys():
                     self.validate_env_var_allowed(key)
-            for key, tmpl in injector.items():
-                try:
-                    sandbox.ImmutableSandboxedEnvironment(undefined=StrictUndefined).from_string(tmpl).render(valid_namespace)
-                except UndefinedError as e:
-                    raise django_exceptions.ValidationError(
-                        _('{sub_key} uses an undefined field ({error_msg})').format(sub_key=key, error_msg=e),
-                        code='invalid',
-                        params={'value': value},
-                    )
-                except SecurityError as e:
-                    raise django_exceptions.ValidationError(_('Encountered unsafe code execution: {}').format(e))
-                except TemplateSyntaxError as e:
-                    raise django_exceptions.ValidationError(
-                        _('Syntax error rendering template for {sub_key} inside of {type} ({error_msg})').format(sub_key=key, type=type_, error_msg=e),
-                        code='invalid',
-                        params={'value': value},
-                    )
+            if type_ == 'extra_vars':
+                validate_extra_vars(None, injector)
+            else:
+                for key, tmpl in injector.items():
+                    validate_template_string(type_, key, tmpl)
 
 
 class AskForField(models.BooleanField):
@@ -939,6 +843,16 @@ class OrderedManyToManyDescriptor(ManyToManyDescriptor):
                 def get_queryset(self):
                     return super(OrderedManyRelatedManager, self).get_queryset().order_by('%s__position' % self.through._meta.model_name)
 
+                def add(self, *objects):
+                    if len(objects) > 1:
+                        raise RuntimeError('Ordered many-to-many fields do not support multiple objects')
+                    return super().add(*objects)
+
+                def remove(self, *objects):
+                    if len(objects) > 1:
+                        raise RuntimeError('Ordered many-to-many fields do not support multiple objects')
+                    return super().remove(*objects)
+
             return OrderedManyRelatedManager
 
         return add_custom_queryset_to_many_related_manager(
@@ -956,13 +870,12 @@ class OrderedManyToManyField(models.ManyToManyField):
     by a special `position` column on the M2M table
     """
 
-    def _update_m2m_position(self, sender, **kwargs):
-        if kwargs.get('action') in ('post_add', 'post_remove'):
-            order_with_respect_to = None
-            for field in sender._meta.local_fields:
-                if isinstance(field, models.ForeignKey) and isinstance(kwargs['instance'], field.related_model):
-                    order_with_respect_to = field.name
-            for i, ig in enumerate(sender.objects.filter(**{order_with_respect_to: kwargs['instance'].pk})):
+    def _update_m2m_position(self, sender, instance, action, **kwargs):
+        if action in ('post_add', 'post_remove'):
+            descriptor = getattr(instance, self.name)
+            order_with_respect_to = descriptor.source_field_name
+
+            for i, ig in enumerate(sender.objects.filter(**{order_with_respect_to: instance.pk}).order_by('id')):
                 if ig.position != i:
                     ig.position = i
                     ig.save()

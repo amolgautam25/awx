@@ -5,7 +5,8 @@ from unittest import mock
 
 from collections import namedtuple
 
-from awx.api.views import ApiVersionRootView, JobTemplateLabelList, InventoryInventorySourcesUpdate, JobTemplateSurveySpec
+from awx.api.views.root import ApiVersionRootView
+from awx.api.views import JobTemplateLabelList, InventoryInventorySourcesUpdate, JobTemplateSurveySpec
 
 from awx.main.views import handle_error
 
@@ -23,7 +24,7 @@ class TestApiRootView:
         endpoints = [
             'ping',
             'config',
-            #'settings',
+            # 'settings',
             'me',
             'dashboard',
             'organizations',
@@ -49,6 +50,7 @@ class TestApiRootView:
             'activity_stream',
             'workflow_job_templates',
             'workflow_jobs',
+            'analytics',
         ]
         view = ApiVersionRootView()
         ret = view.get(mocker.MagicMock())
@@ -59,31 +61,31 @@ class TestApiRootView:
 
 class TestJobTemplateLabelList:
     def test_inherited_mixin_unattach(self):
-        with mock.patch('awx.api.generics.DeleteLastUnattachLabelMixin.unattach') as mixin_unattach:
+        with mock.patch('awx.api.views.labels.LabelSubListCreateAttachDetachView.unattach') as mixin_unattach:
             view = JobTemplateLabelList()
             mock_request = mock.MagicMock()
 
             super(JobTemplateLabelList, view).unattach(mock_request, None, None)
-            assert mixin_unattach.called_with(mock_request, None, None)
+            mixin_unattach.assert_called_with(mock_request, None, None)
 
 
 class TestInventoryInventorySourcesUpdate:
     @pytest.mark.parametrize(
-        "can_update, can_access, is_source, is_up_on_proj, expected",
+        "can_update, can_access, is_source, expected",
         [
-            (True, True, "ec2", False, [{'status': 'started', 'inventory_update': 1, 'inventory_source': 1}]),
-            (False, True, "gce", False, [{'status': 'Could not start because `can_update` returned False', 'inventory_source': 1}]),
-            (True, False, "scm", True, [{'status': 'started', 'inventory_update': 1, 'inventory_source': 1}]),
+            (True, True, "ec2", [{'status': 'started', 'inventory_update': 1, 'inventory_source': 1}]),
+            (False, True, "gce", [{'status': 'Could not start because `can_update` returned False', 'inventory_source': 1}]),
+            (True, False, "scm", [{'status': 'started', 'inventory_update': 1, 'inventory_source': 1}]),
         ],
     )
-    def test_post(self, mocker, can_update, can_access, is_source, is_up_on_proj, expected):
+    def test_post(self, mocker, can_update, can_access, is_source, expected):
         class InventoryUpdate:
             id = 1
 
         class Project:
             name = 'project'
 
-        InventorySource = namedtuple('InventorySource', ['source', 'update_on_project_update', 'pk', 'can_update', 'update', 'source_project'])
+        InventorySource = namedtuple('InventorySource', ['source', 'pk', 'can_update', 'update', 'source_project'])
 
         class InventorySources(object):
             def all(self):
@@ -92,7 +94,6 @@ class TestInventoryInventorySourcesUpdate:
                         pk=1,
                         source=is_source,
                         source_project=Project,
-                        update_on_project_update=is_up_on_proj,
                         can_update=can_update,
                         update=lambda: InventoryUpdate,
                     )
@@ -107,15 +108,16 @@ class TestInventoryInventorySourcesUpdate:
         mock_request = mocker.MagicMock()
         mock_request.user.can_access.return_value = can_access
 
-        with mocker.patch.object(InventoryInventorySourcesUpdate, 'get_object', return_value=obj):
-            with mocker.patch.object(InventoryInventorySourcesUpdate, 'get_serializer_context', return_value=None):
-                with mocker.patch('awx.api.serializers.InventoryUpdateDetailSerializer') as serializer_class:
-                    serializer = serializer_class.return_value
-                    serializer.to_representation.return_value = {}
+        mocker.patch.object(InventoryInventorySourcesUpdate, 'get_object', return_value=obj)
+        mocker.patch.object(InventoryInventorySourcesUpdate, 'get_serializer_context', return_value=None)
+        serializer_class = mocker.patch('awx.api.serializers.InventoryUpdateDetailSerializer')
 
-                    view = InventoryInventorySourcesUpdate()
-                    response = view.post(mock_request)
-                    assert response.data == expected
+        serializer = serializer_class.return_value
+        serializer.to_representation.return_value = {}
+
+        view = InventoryInventorySourcesUpdate()
+        response = view.post(mock_request)
+        assert response.data == expected
 
 
 class TestSurveySpecValidation:

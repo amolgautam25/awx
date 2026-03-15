@@ -10,22 +10,24 @@ from django.contrib.sessions.models import Session
 from django.utils.timezone import now as tz_now
 from django.utils.translation import gettext_lazy as _
 
+# django-ansible-base
+from ansible_base.resource_registry.fields import AnsibleResourceField
 
 # AWX
 from awx.api.versioning import reverse
-from awx.main.fields import AutoOneToOneField, ImplicitRoleField, OrderedManyToManyField
-from awx.main.models.base import BaseModel, CommonModel, CommonModelNameNotUnique, CreatedModifiedModel, NotificationFieldsModel
+from awx.main.fields import ImplicitRoleField, OrderedManyToManyField
+from awx.main.models.base import BaseModel, CommonModel, CommonModelNameNotUnique, NotificationFieldsModel
 from awx.main.models.rbac import (
     ROLE_SINGLETON_SYSTEM_ADMINISTRATOR,
     ROLE_SINGLETON_SYSTEM_AUDITOR,
 )
 from awx.main.models.unified_jobs import UnifiedJob
-from awx.main.models.mixins import ResourceMixin, CustomVirtualEnvMixin, RelatedJobsMixin
+from awx.main.models.mixins import ResourceMixin, CustomVirtualEnvMixin, RelatedJobsMixin, OpaQueryPathMixin
 
-__all__ = ['Organization', 'Team', 'Profile', 'UserSessionMembership']
+__all__ = ['Organization', 'Team', 'UserSessionMembership']
 
 
-class Organization(CommonModel, NotificationFieldsModel, ResourceMixin, CustomVirtualEnvMixin, RelatedJobsMixin):
+class Organization(CommonModel, NotificationFieldsModel, ResourceMixin, CustomVirtualEnvMixin, RelatedJobsMixin, OpaQueryPathMixin):
     """
     An organization is the basic unit of multi-tenancy divisions
     """
@@ -33,6 +35,12 @@ class Organization(CommonModel, NotificationFieldsModel, ResourceMixin, CustomVi
     class Meta:
         app_label = 'main'
         ordering = ('name',)
+        permissions = [
+            ('member_organization', 'Basic participation permissions for organization'),
+            ('audit_organization', 'Audit everything inside the organization'),
+        ]
+        # Remove add permission, only superuser can add
+        default_permissions = ('change', 'delete', 'view')
 
     instance_groups = OrderedManyToManyField('InstanceGroup', blank=True, through='OrganizationInstanceGroupMembership')
     galaxy_credentials = OrderedManyToManyField(
@@ -103,6 +111,7 @@ class Organization(CommonModel, NotificationFieldsModel, ResourceMixin, CustomVi
     approval_role = ImplicitRoleField(
         parent_role='admin_role',
     )
+    resource = AnsibleResourceField(primary_key_field="id")
 
     def get_absolute_url(self, request=None):
         return reverse('api:organization_detail', kwargs={'pk': self.pk}, request=request)
@@ -114,16 +123,8 @@ class Organization(CommonModel, NotificationFieldsModel, ResourceMixin, CustomVi
     def _get_related_jobs(self):
         return UnifiedJob.objects.non_polymorphic().filter(organization=self)
 
-    def create_default_galaxy_credential(self):
-        from awx.main.models import Credential
-
-        public_galaxy_credential = Credential.objects.filter(managed=True, name='Ansible Galaxy').first()
-        if public_galaxy_credential is not None and public_galaxy_credential not in self.galaxy_credentials.all():
-            self.galaxy_credentials.add(public_galaxy_credential)
-
 
 class OrganizationGalaxyCredentialMembership(models.Model):
-
     organization = models.ForeignKey('Organization', on_delete=models.CASCADE)
     credential = models.ForeignKey('Credential', on_delete=models.CASCADE)
     position = models.PositiveIntegerField(
@@ -142,6 +143,7 @@ class Team(CommonModelNameNotUnique, ResourceMixin):
         app_label = 'main'
         unique_together = [('organization', 'name')]
         ordering = ('organization__name', 'name')
+        permissions = [('member_team', 'Inherit all roles assigned to this team')]
 
     organization = models.ForeignKey(
         'Organization',
@@ -159,25 +161,10 @@ class Team(CommonModelNameNotUnique, ResourceMixin):
     read_role = ImplicitRoleField(
         parent_role=['organization.auditor_role', 'member_role'],
     )
+    resource = AnsibleResourceField(primary_key_field="id")
 
     def get_absolute_url(self, request=None):
         return reverse('api:team_detail', kwargs={'pk': self.pk}, request=request)
-
-
-class Profile(CreatedModifiedModel):
-    """
-    Profile model related to User object. Currently stores LDAP DN for users
-    loaded from LDAP.
-    """
-
-    class Meta:
-        app_label = 'main'
-
-    user = AutoOneToOneField('auth.User', related_name='profile', editable=False, on_delete=models.CASCADE)
-    ldap_dn = models.CharField(
-        max_length=1024,
-        default='',
-    )
 
 
 class UserSessionMembership(BaseModel):

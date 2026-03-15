@@ -1,11 +1,11 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
+from zoneinfo import ZoneInfo
 
 from django.utils.timezone import now
 from django.db.utils import IntegrityError
 from unittest import mock
 import pytest
-import pytz
 
 from awx.main.models import JobTemplate, Schedule, ActivityStream
 
@@ -20,7 +20,6 @@ def job_template(inventory, project):
 
 @pytest.mark.django_db
 class TestComputedFields:
-
     # expired in 2015, so next_run should not be populated
     dead_rrule = "DTSTART;TZID=UTC:20140520T190000 RRULE:FREQ=YEARLY;INTERVAL=1;BYMONTH=1;BYMONTHDAY=1;UNTIL=20150530T000000Z"
     continuing_rrule = "DTSTART;TZID=UTC:20140520T190000 RRULE:FREQ=YEARLY;INTERVAL=1;BYMONTH=1;BYMONTHDAY=1"
@@ -77,7 +76,7 @@ class TestComputedFields:
         with self.assert_no_unwanted_stuff(s):
             # force update of next_run, as if schedule re-calculation had not happened
             # since this time
-            old_next_run = datetime(2009, 3, 13, tzinfo=pytz.utc)
+            old_next_run = datetime(2009, 3, 13, tzinfo=timezone.utc)
             Schedule.objects.filter(pk=s.pk).update(next_run=old_next_run)
             s.next_run = old_next_run
             prior_modified = s.modified
@@ -124,28 +123,14 @@ class TestComputedFields:
 
 @pytest.mark.django_db
 @pytest.mark.parametrize('freq, delta', (('MINUTELY', 1), ('HOURLY', 1)))
-def test_past_week_rrule(job_template, freq, delta):
-    # see: https://github.com/ansible/awx/issues/8071
-    recent = datetime.utcnow() - timedelta(days=3)
-    recent = recent.replace(hour=0, minute=0, second=0, microsecond=0)
-    recent_dt = recent.strftime('%Y%m%d')
-    rrule = f'DTSTART;TZID=America/New_York:{recent_dt}T000000 RRULE:FREQ={freq};INTERVAL={delta};COUNT=5'  # noqa
-    sched = Schedule.objects.create(name='example schedule', rrule=rrule, unified_job_template=job_template)
-    first_event = sched.rrulestr(sched.rrule)[0]
-    assert first_event.replace(tzinfo=None) == recent
-
-
-@pytest.mark.django_db
-@pytest.mark.parametrize('freq, delta', (('MINUTELY', 1), ('HOURLY', 1)))
 def test_really_old_dtstart(job_template, freq, delta):
     # see: https://github.com/ansible/awx/issues/8071
     # If an event is per-minute/per-hour and was created a *really long*
-    # time ago, we should just bump forward to start counting "in the last week"
+    # time ago, we should just bump forward the dtstart
     rrule = f'DTSTART;TZID=America/New_York:20150101T000000 RRULE:FREQ={freq};INTERVAL={delta}'  # noqa
     sched = Schedule.objects.create(name='example schedule', rrule=rrule, unified_job_template=job_template)
-    last_week = (datetime.utcnow() - timedelta(days=7)).date()
     first_event = sched.rrulestr(sched.rrule)[0]
-    assert last_week == first_event.date()
+    assert now() - first_event < timedelta(days=1)
 
     # the next few scheduled events should be the next minute/hour incremented
     next_five_events = list(sched.rrulestr(sched.rrule).xafter(now(), count=5))
@@ -251,18 +236,17 @@ def test_utc_until(job_template, until, dtend):
 
 @pytest.mark.django_db
 @pytest.mark.parametrize(
-    'dtstart, until',
+    'rrule, length',
     [
-        ['DTSTART:20380601T120000Z', '20380601T170000'],  # noon UTC to 5PM UTC
-        ['DTSTART;TZID=America/New_York:20380601T120000', '20380601T170000'],  # noon EST to 5PM EST
+        ['DTSTART:20380601T120000Z RRULE:FREQ=HOURLY;INTERVAL=1;UNTIL=20380601T170000', 6],  # noon UTC to 5PM UTC (noon, 1pm, 2, 3, 4, 5pm)
+        ['DTSTART;TZID=America/New_York:20380601T120000 RRULE:FREQ=HOURLY;INTERVAL=1;UNTIL=20380601T170000', 6],  # noon EST to 5PM EST
     ],
 )
-def test_tzinfo_naive_until(job_template, dtstart, until):
-    rrule = '{} RRULE:FREQ=HOURLY;INTERVAL=1;UNTIL={}'.format(dtstart, until)  # noqa
+def test_tzinfo_naive_until(job_template, rrule, length):
     s = Schedule(name='Some Schedule', rrule=rrule, unified_job_template=job_template)
     s.save()
     gen = Schedule.rrulestr(s.rrule).xafter(now(), count=20)
-    assert len(list(gen)) == 6  # noon, 1PM, 2, 3, 4, 5PM
+    assert len(list(gen)) == length
 
 
 @pytest.mark.django_db
@@ -275,7 +259,7 @@ def test_utc_until_in_the_past(job_template):
 
 
 @pytest.mark.django_db
-@mock.patch('awx.main.models.schedules.now', lambda: datetime(2030, 3, 5, tzinfo=pytz.utc))
+@mock.patch('awx.main.models.schedules.now', lambda: datetime(2030, 3, 5, tzinfo=timezone.utc))
 def test_dst_phantom_hour(job_template):
     # The DST period in the United States begins at 02:00 (2 am) local time, so
     # the hour from 2:00:00 to 2:59:59 does not exist in the night of the
@@ -309,6 +293,12 @@ def test_beginning_of_time(job_template):
     [
         ['DTSTART:20300112T210000Z RRULE:FREQ=DAILY;INTERVAL=1', 'UTC'],
         ['DTSTART;TZID=US/Eastern:20300112T210000 RRULE:FREQ=DAILY;INTERVAL=1', 'US/Eastern'],
+        ['DTSTART;TZID=US/Eastern:20300112T210000 RRULE:FREQ=DAILY;INTERVAL=1 EXRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=SU', 'US/Eastern'],
+        # Technically the serializer should never let us get 2 dtstarts in a rule but its still valid and the rrule will prefer the last DTSTART
+        [
+            'DTSTART;TZID=US/Eastern:20300112T210000 RRULE:FREQ=DAILY;INTERVAL=1 EXRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=SU DTSTART;TZID=US/Pacific:20300112T210000',
+            'US/Pacific',
+        ],
     ],
 )
 def test_timezone_property(job_template, rrule, tz):
@@ -389,3 +379,163 @@ def test_duplicate_name_within_template(job_template):
         s2.save()
 
     assert str(ierror.value) == "UNIQUE constraint failed: main_schedule.unified_job_template_id, main_schedule.name"
+
+
+# Test until with multiple entries (should only return the first)
+# NOTE: this test may change once we determine how the UI will start to handle this field
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'rrule, expected_until',
+    [
+        pytest.param('DTSTART:20380601T120000Z RRULE:FREQ=HOURLY;INTERVAL=1', '', id="No until"),
+        pytest.param('DTSTART:20380601T120000Z RRULE:FREQ=HOURLY;INTERVAL=1;UNTIL=20380601T170000Z', '2038-06-01T17:00:00', id="One until in UTC"),
+        pytest.param(
+            'DTSTART;TZID=America/New_York:20380601T120000 RRULE:FREQ=HOURLY;INTERVAL=1;UNTIL=20380601T170000',
+            '2038-06-01T17:00:00',
+            id="One until in local TZ",
+        ),
+        pytest.param(
+            'DTSTART;TZID=America/New_York:20380601T120000 RRULE:FREQ=HOURLY;INTERVAL=1;UNTIL=20380601T220000 RRULE:FREQ=MINUTELY;INTERVAL=1;UNTIL=20380601T170000',
+            '2038-06-01T22:00:00',
+            id="Multiple untils (return only the first one",
+        ),
+    ],
+)
+def test_until_with_complex_schedules(job_template, rrule, expected_until):
+    sched = Schedule(name='Some Schedule', rrule=rrule, unified_job_template=job_template)
+    assert sched.until == expected_until
+
+
+# Test coerce_naive_until, this method takes a naive until field and forces it into utc
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'rrule, expected_result',
+    [
+        pytest.param(
+            'DTSTART:20380601T120000Z RRULE:FREQ=HOURLY;INTERVAL=1',
+            'DTSTART:20380601T120000Z RRULE:FREQ=HOURLY;INTERVAL=1',
+            id="No untils present",
+        ),
+        pytest.param(
+            'DTSTART:20380601T120000Z RRULE:FREQ=HOURLY;INTERVAL=1;UNTIL=20380601T170000Z',
+            'DTSTART:20380601T120000Z RRULE:FREQ=HOURLY;INTERVAL=1;UNTIL=20380601T170000Z',
+            id="One until already in UTC",
+        ),
+        pytest.param(
+            'DTSTART;TZID=America/New_York:20380601T120000 RRULE:FREQ=HOURLY;INTERVAL=1;UNTIL=20380601T170000',
+            'DTSTART;TZID=America/New_York:20380601T120000 RRULE:FREQ=HOURLY;INTERVAL=1;UNTIL=20380601T220000Z',
+            id="One until with local tz",
+        ),
+        pytest.param(
+            'DTSTART:20380601T120000Z RRULE:FREQ=MINUTLEY;INTERVAL=1;UNTIL=20380601T170000Z EXRULE:FREQ=HOURLY;INTERVAL=1;UNTIL=20380601T170000Z',
+            'DTSTART:20380601T120000Z RRULE:FREQ=MINUTLEY;INTERVAL=1;UNTIL=20380601T170000Z EXRULE:FREQ=HOURLY;INTERVAL=1;UNTIL=20380601T170000Z',
+            id="Multiple untils all in UTC",
+        ),
+        pytest.param(
+            'DTSTART;TZID=America/New_York:20380601T120000 RRULE:FREQ=MINUTELY;INTERVAL=1;UNTIL=20380601T170000 EXRULE:FREQ=HOURLY;INTERVAL=1;UNTIL=20380601T170000',
+            'DTSTART;TZID=America/New_York:20380601T120000 RRULE:FREQ=MINUTELY;INTERVAL=1;UNTIL=20380601T220000Z EXRULE:FREQ=HOURLY;INTERVAL=1;UNTIL=20380601T220000Z',
+            id="Multiple untils with local tz",
+        ),
+        pytest.param(
+            'DTSTART;TZID=America/New_York:20380601T120000 RRULE:FREQ=MINUTELY;INTERVAL=1;UNTIL=20380601T170000Z EXRULE:FREQ=HOURLY;INTERVAL=1;UNTIL=20380601T170000',
+            'DTSTART;TZID=America/New_York:20380601T120000 RRULE:FREQ=MINUTELY;INTERVAL=1;UNTIL=20380601T170000Z EXRULE:FREQ=HOURLY;INTERVAL=1;UNTIL=20380601T220000Z',
+            id="Multiple untils mixed",
+        ),
+    ],
+)
+def test_coerce_naive_until(rrule, expected_result):
+    new_rrule = Schedule.coerce_naive_until(rrule)
+    assert new_rrule == expected_result
+
+
+# Test skipping days with exclusion
+@pytest.mark.django_db
+def test_skip_sundays():
+    rrule = '''
+      DTSTART;TZID=America/New_York:20220310T150000
+      RRULE:INTERVAL=1;FREQ=DAILY
+      EXRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=SU
+    '''
+    tz = ZoneInfo("America/New_York")
+    friday_apr_29th = datetime(2022, 4, 29, 0, 0, 0, 0, tz)
+    monday_may_2nd = datetime(2022, 5, 2, 23, 59, 59, 999, tz)
+    ruleset = Schedule.rrulestr(rrule)
+    gen = ruleset.between(friday_apr_29th, monday_may_2nd, True)
+    # We should only get Fri, Sat and Mon (skipping Sunday)
+    assert len(list(gen)) == 3
+    saturday_night = datetime(2022, 4, 30, 23, 59, 59, 9999, tz)
+    monday_morning = datetime(2022, 5, 2, 0, 0, 0, 0, tz)
+    gen = ruleset.between(saturday_night, monday_morning, True)
+    assert len(list(gen)) == 0
+
+
+# Test the get_end_date function
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'rrule, expected_result',
+    [
+        pytest.param(
+            'DTSTART;TZID=America/New_York:20210310T150000 RRULE:INTERVAL=1;FREQ=DAILY;UNTIL=20210430T150000Z EXRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=SU;COUNT=5',
+            datetime(2021, 4, 29, 19, 0, 0, tzinfo=timezone.utc),
+            id="Single rule in rule set with UTC TZ aware until",
+        ),
+        pytest.param(
+            'DTSTART;TZID=America/New_York:20220310T150000 RRULE:INTERVAL=1;FREQ=DAILY;UNTIL=20220430T150000 EXRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=SU;COUNT=5',
+            datetime(2022, 4, 30, 19, 0, tzinfo=timezone.utc),
+            id="Single rule in ruleset with naive until",
+        ),
+        pytest.param(
+            'DTSTART;TZID=America/New_York:20220310T150000 RRULE:INTERVAL=1;FREQ=DAILY;COUNT=4 EXRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=SU;COUNT=5',
+            datetime(2022, 3, 12, 20, 0, tzinfo=timezone.utc),
+            id="Single rule in ruleset with count",
+        ),
+        pytest.param(
+            'DTSTART;TZID=America/New_York:20220310T150000 RRULE:INTERVAL=1;FREQ=DAILY EXRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=SU;COUNT=5',
+            None,
+            id="Single rule in ruleset with no end",
+        ),
+        pytest.param(
+            'DTSTART;TZID=America/New_York:20220310T150000 RRULE:INTERVAL=1;FREQ=DAILY',
+            None,
+            id="Single rule in rule with no end",
+        ),
+        pytest.param(
+            'DTSTART;TZID=America/New_York:20220310T150000 RRULE:INTERVAL=1;FREQ=DAILY;UNTIL=20220430T150000Z',
+            datetime(2022, 4, 29, 19, 0, tzinfo=timezone.utc),
+            id="Single rule in rule with UTZ TZ aware until",
+        ),
+        pytest.param(
+            'DTSTART;TZID=America/New_York:20220310T150000 RRULE:INTERVAL=1;FREQ=DAILY;UNTIL=20220430T150000',
+            datetime(2022, 4, 30, 19, 0, tzinfo=timezone.utc),
+            id="Single rule in rule with naive until",
+        ),
+        pytest.param(
+            'DTSTART;TZID=America/New_York:20220310T150000 RRULE:INTERVAL=1;FREQ=DAILY;BYDAY=SU RRULE:INTERVAL=1;FREQ=DAILY;BYDAY=MO',
+            None,
+            id="Multi rule with no end",
+        ),
+        pytest.param(
+            'DTSTART;TZID=America/New_York:20220310T150000 RRULE:INTERVAL=1;FREQ=DAILY;BYDAY=SU RRULE:INTERVAL=1;FREQ=DAILY;BYDAY=MO;COUNT=4',
+            None,
+            id="Multi rule one with no end and one with an count",
+        ),
+        pytest.param(
+            'DTSTART;TZID=America/New_York:20220310T150000 RRULE:INTERVAL=1;FREQ=DAILY;BYDAY=SU;UNTIL=20220430T1500Z RRULE:INTERVAL=1;FREQ=DAILY;BYDAY=MO;COUNT=4',
+            datetime(2022, 4, 24, 19, 0, tzinfo=timezone.utc),
+            id="Multi rule one with until and one with an count",
+        ),
+        pytest.param(
+            'DTSTART;TZID=America/New_York:20010430T1500 RRULE:INTERVAL=1;FREQ=DAILY;BYDAY=SU;COUNT=1',
+            datetime(2001, 5, 6, 19, 0, tzinfo=timezone.utc),
+            id="Rule with count but ends in the past",
+        ),
+        pytest.param(
+            'DTSTART;TZID=America/New_York:20220430T1500 RRULE:INTERVAL=1;FREQ=DAILY;BYDAY=SU;UNTIL=20010430T1500',
+            None,
+            id="Rule with until that ends in the past",
+        ),
+    ],
+)
+def test_get_end_date(rrule, expected_result):
+    ruleset = Schedule.rrulestr(rrule)
+    assert expected_result == Schedule.get_end_date(ruleset)

@@ -13,6 +13,8 @@ from channels.generic.websocket import AsyncJsonWebsocketConsumer
 from channels.layers import get_channel_layer
 from channels.db import database_sync_to_async
 
+from awx.main.utils.redis import get_redis_client_async
+
 logger = logging.getLogger('awx.main.consumers')
 XRF_KEY = '_auth_user_xrf'
 
@@ -39,10 +41,10 @@ class WebsocketSecretAuthHelper:
     @classmethod
     def verify_secret(cls, s, nonce_tolerance=300):
         try:
-            (prefix, payload) = s.split(' ')
+            prefix, payload = s.split(' ')
             if prefix != 'HMAC-SHA256':
                 raise ValueError('Unsupported encryption algorithm')
-            (nonce_parsed, secret_parsed) = payload.split(':')
+            nonce_parsed, secret_parsed = payload.split(':')
         except Exception:
             raise ValueError("Failed to parse secret")
 
@@ -80,7 +82,7 @@ class WebsocketSecretAuthHelper:
         WebsocketSecretAuthHelper.verify_secret(secret)
 
 
-class BroadcastConsumer(AsyncJsonWebsocketConsumer):
+class RelayConsumer(AsyncJsonWebsocketConsumer):
     async def connect(self):
         try:
             WebsocketSecretAuthHelper.is_authorized(self.scope)
@@ -93,12 +95,31 @@ class BroadcastConsumer(AsyncJsonWebsocketConsumer):
         await self.channel_layer.group_add(settings.BROADCAST_WEBSOCKET_GROUP_NAME, self.channel_name)
         logger.info(f"client '{self.channel_name}' joined the broadcast group.")
 
+        # Initialize Redis client once for reuse across all message handling
+        self._redis_conn = get_redis_client_async()
+
     async def disconnect(self, code):
         logger.info(f"client '{self.channel_name}' disconnected from the broadcast group.")
         await self.channel_layer.group_discard(settings.BROADCAST_WEBSOCKET_GROUP_NAME, self.channel_name)
 
     async def internal_message(self, event):
         await self.send(event['text'])
+
+    async def receive_json(self, data):
+        group, message = unwrap_broadcast_msg(data)
+        if group == "metrics":
+            message = json.loads(message['text'])
+            await self._redis_conn.set(
+                settings.SUBSYSTEM_METRICS_REDIS_KEY_PREFIX + "-" + message['metrics_namespace'] + "_instance_" + message['instance'], message['metrics']
+            )
+        else:
+            await self.channel_layer.group_send(group, message)
+
+    async def consumer_subscribe(self, event):
+        await self.send_json(event)
+
+    async def consumer_unsubscribe(self, event):
+        await self.send_json(event)
 
 
 class EventConsumer(AsyncJsonWebsocketConsumer):
@@ -127,6 +148,11 @@ class EventConsumer(AsyncJsonWebsocketConsumer):
                 group_name,
                 self.channel_name,
             )
+
+        await self.channel_layer.group_send(
+            settings.BROADCAST_WEBSOCKET_GROUP_NAME,
+            {"type": "consumer.unsubscribe", "groups": list(current_groups), "origin_channel": self.channel_name},
+        )
 
     @database_sync_to_async
     def user_can_see_object_id(self, user_access, oid):
@@ -176,9 +202,20 @@ class EventConsumer(AsyncJsonWebsocketConsumer):
                     self.channel_name,
                 )
 
+            if len(old_groups):
+                await self.channel_layer.group_send(
+                    settings.BROADCAST_WEBSOCKET_GROUP_NAME,
+                    {"type": "consumer.unsubscribe", "groups": list(old_groups), "origin_channel": self.channel_name},
+                )
+
             new_groups_exclusive = new_groups - current_groups
             for group_name in new_groups_exclusive:
                 await self.channel_layer.group_add(group_name, self.channel_name)
+
+            await self.channel_layer.group_send(
+                settings.BROADCAST_WEBSOCKET_GROUP_NAME,
+                {"type": "consumer.subscribe", "groups": list(new_groups), "origin_channel": self.channel_name},
+            )
             self.scope['session']['groups'] = new_groups
             await self.send_json({"groups_current": list(new_groups), "groups_left": list(old_groups), "groups_joined": list(new_groups_exclusive)})
 
@@ -200,9 +237,11 @@ def _dump_payload(payload):
         return None
 
 
-def emit_channel_notification(group, payload):
-    from awx.main.wsbroadcast import wrap_broadcast_msg  # noqa
+def unwrap_broadcast_msg(payload: dict):
+    return (payload['group'], payload['message'])
 
+
+def emit_channel_notification(group, payload):
     payload_dumped = _dump_payload(payload)
     if payload_dumped is None:
         return
@@ -212,16 +251,6 @@ def emit_channel_notification(group, payload):
     run_sync(
         channel_layer.group_send(
             group,
-            {"type": "internal.message", "text": payload_dumped},
-        )
-    )
-
-    run_sync(
-        channel_layer.group_send(
-            settings.BROADCAST_WEBSOCKET_GROUP_NAME,
-            {
-                "type": "internal.message",
-                "text": wrap_broadcast_msg(group, payload_dumped),
-            },
+            {"type": "internal.message", "text": payload_dumped, "needs_relay": True},
         )
     )

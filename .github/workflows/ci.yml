@@ -1,13 +1,53 @@
 ---
 name: CI
 env:
-  BRANCH: ${{ github.base_ref || 'devel' }}
+  LC_ALL: "C.UTF-8" # prevent ERROR: Ansible could not initialize the preferred locale: unsupported locale setting
+  CI_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  DEV_DOCKER_OWNER: ${{ github.repository_owner }}
+  COMPOSE_TAG: ${{ github.base_ref || github.ref_name || 'devel' }}
+  UPSTREAM_REPOSITORY_ID: 91594105
 on:
   pull_request:
+  push:
+    branches:
+      - devel  # needed to publish code coverage post-merge
+  schedule:
+    - cron: '0 12,18 * * 1-5'
+  workflow_dispatch: {}
 jobs:
+  trigger-release-branches:
+    name: "Dispatch CI to release branches"
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Trigger CI on release_4.6
+        id: dispatch_release_46
+        continue-on-error: true
+        run: gh workflow run ci.yml --ref release_4.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+      - name: Trigger CI on stable-2.6
+        id: dispatch_stable_26
+        continue-on-error: true
+        run: gh workflow run ci.yml --ref stable-2.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+      - name: Check dispatch results
+        if: steps.dispatch_release_46.outcome == 'failure' || steps.dispatch_stable_26.outcome == 'failure'
+        run: |
+          echo "One or more dispatches failed:"
+          echo "  release_4.6: ${{ steps.dispatch_release_46.outcome }}"
+          echo "  stable-2.6: ${{ steps.dispatch_stable_26.outcome }}"
+          exit 1
+
   common-tests:
     name: ${{ matrix.tests.name }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       packages: write
       contents: read
@@ -16,122 +56,435 @@ jobs:
       matrix:
         tests:
           - name: api-test
-            command: /start_tests.sh
-            label: Run API Tests
+            command: /start_tests.sh test_coverage
+            coverage-upload-name: ""
+          - name: api-migrations
+            command: /start_tests.sh test_migrations
+            coverage-upload-name: ""
           - name: api-lint
             command: /var/lib/awx/venv/awx/bin/tox -e linters
-            label: Run API Linters
-          - name: api-swagger
-            command: /start_tests.sh swagger
-            label: Generate API Reference
+            coverage-upload-name: ""
           - name: awx-collection
             command: /start_tests.sh test_collection_all
-            label: Run Collection Tests
-          - name: api-schema
-            label: Check API Schema
-            command: /start_tests.sh detect-schema-change SCHEMA_DIFF_BASE_BRANCH=${{ github.event.pull_request.base.ref }}
-          - name: ui-lint
-            label: Run UI Linters
-            command: make ui-lint
-          - name: ui-test-screens
-            label: Run UI Screens Tests
-            command: make ui-test-screens
-          - name: ui-test-general
-            label: Run UI General Tests
-            command: make ui-test-general
+            coverage-upload-name: "awx-collection"
+
     steps:
-      - uses: actions/checkout@v2
-
-      - name: Get python version from Makefile
-        run: echo py_version=`make PYTHON_VERSION` >> $GITHUB_ENV
-
-      - name: Install python ${{ env.py_version }}
-        uses: actions/setup-python@v2
+      - uses: actions/checkout@v4
         with:
-          python-version: ${{ env.py_version }}
+          show-progress: false
 
-      - name: Log in to registry
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Build awx_devel image for running checks
+        uses: ./.github/actions/awx_devel_image
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          private-github-key: ${{ secrets.PRIVATE_GITHUB_KEY }}
 
-      - name: Pre-pull image to warm build cache
-        run: |
-          docker pull ghcr.io/${{ github.repository_owner }}/awx_devel:${{ env.BRANCH }} || :
+      - name: Run check ${{ matrix.tests.name }}
+        id: make-run
+        run: >-
+          AWX_DOCKER_ARGS='-e GITHUB_ACTIONS -e GITHUB_OUTPUT -v "${GITHUB_OUTPUT}:${GITHUB_OUTPUT}:rw,Z"'
+          AWX_DOCKER_CMD='${{ matrix.tests.command }}'
+          make docker-runner
 
-      - name: Build image
+      - name: Inject PR number into coverage.xml
+        if: >-
+          !cancelled()
+          && github.event_name == 'pull_request'
+          && steps.make-run.outputs.cov-report-files != ''
         run: |
-          DEV_DOCKER_TAG_BASE=ghcr.io/${{ github.repository_owner }} COMPOSE_TAG=${{ env.BRANCH }} make docker-compose-build
+          if [ -f "reports/coverage.xml" ]; then
+            sed -i '2i<!-- PR ${{ github.event.pull_request.number }} -->' reports/coverage.xml
+            echo "Injected PR number ${{ github.event.pull_request.number }} into reports/coverage.xml"
+          fi
+          if [ -f "awxkit/coverage.xml" ]; then
+            sed -i '2i<!-- PR ${{ github.event.pull_request.number }} -->' awxkit/coverage.xml
+            echo "Injected PR number ${{ github.event.pull_request.number }} into awxkit/coverage.xml"
+          fi
 
-      - name: ${{ matrix.texts.label }}
-        run: |
-          docker run -u $(id -u) --rm -v ${{ github.workspace}}:/awx_devel/:Z \
-            --workdir=/awx_devel ghcr.io/${{ github.repository_owner }}/awx_devel:${{ env.BRANCH }} ${{ matrix.tests.command }}
+      - name: Upload test coverage to Codecov
+        if: >-
+          !cancelled()
+          && steps.make-run.outputs.cov-report-files != ''
+        uses: codecov/codecov-action@v4
+        with:
+          fail_ci_if_error: >-
+            ${{
+              toJSON(env.UPSTREAM_REPOSITORY_ID == github.repository_id)
+            }}
+          files: >-
+            ${{ steps.make-run.outputs.cov-report-files }}
+          flags: >-
+            CI-GHA,
+            pytest,
+            OS-${{
+              runner.os
+            }}
+          token: ${{ secrets.CODECOV_TOKEN }}
+      - name: Upload test results to Codecov
+        if: >-
+          !cancelled()
+          && steps.make-run.outputs.test-result-files != ''
+        uses: codecov/test-results-action@v1
+        with:
+          fail_ci_if_error: >-
+            ${{
+              toJSON(env.UPSTREAM_REPOSITORY_ID == github.repository_id)
+            }}
+          files: >-
+            ${{ steps.make-run.outputs.test-result-files }}
+          flags: >-
+            CI-GHA,
+            pytest,
+            OS-${{
+              runner.os
+            }}
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.tests.name }}-artifacts
+          path: |
+            reports/coverage.xml
+            awxkit/coverage.xml
+          retention-days: 5
+
+      - name: >-
+          Upload ${{
+            matrix.tests.coverage-upload-name || 'awx'
+          }} jUnit test reports to the unified dashboard
+        if: >-
+          !cancelled()
+          && steps.make-run.outputs.test-result-files != ''
+          && github.event_name == 'push'
+          && env.UPSTREAM_REPOSITORY_ID == github.repository_id
+          && github.ref_name == github.event.repository.default_branch
+        uses: ansible/gh-action-record-test-results@3784db66a1b7fb3809999a7251c8a7203a7ffbe8
+        with:
+          aggregation-server-url: ${{ vars.PDE_ORG_RESULTS_AGGREGATOR_UPLOAD_URL }}
+          http-auth-password: >-
+            ${{ secrets.PDE_ORG_RESULTS_UPLOAD_PASSWORD }}
+          http-auth-username: >-
+            ${{ vars.PDE_ORG_RESULTS_AGGREGATOR_UPLOAD_USER }}
+          project-component-name: >-
+            ${{ matrix.tests.coverage-upload-name || 'awx' }}
+          test-result-files: >-
+            ${{ steps.make-run.outputs.test-result-files }}
+
   dev-env:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v2
-
-      - name: Get python version from Makefile
-        run: echo py_version=`make PYTHON_VERSION` >> $GITHUB_ENV
-
-      - name: Install python ${{ env.py_version }}
-        uses: actions/setup-python@v2
+      - uses: actions/checkout@v4
         with:
-          python-version: ${{ env.py_version }}
+          show-progress: false
 
-      - name: Log in to registry
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      - uses: ./.github/actions/setup-python
+        with:
+          python-version: '3.13'
 
-      - name: Pre-pull image to warm build cache
-        run: |
-          docker pull ghcr.io/${{ github.repository_owner }}/awx_devel:${{ env.BRANCH }} || :
+      - uses: ./.github/actions/run_awx_devel
+        id: awx
+        with:
+          build-ui: false
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          private-github-key: ${{ secrets.PRIVATE_GITHUB_KEY }}
 
-      - name: Build image
-        run: |
-          DEV_DOCKER_TAG_BASE=ghcr.io/${{ github.repository_owner }} COMPOSE_TAG=${{ env.BRANCH }} make docker-compose-build
+      - name: Run live dev env tests
+        run: docker exec tools_awx_1 /bin/bash -c "make live_test"
 
-      - name: Run smoke test
-        run: |
-          export DEV_DOCKER_TAG_BASE=ghcr.io/${{ github.repository_owner }}
-          export COMPOSE_TAG=${{ env.BRANCH }}
-          ansible-playbook tools/docker-compose/ansible/smoke-test.yml -e repo_dir=$(pwd) -v
+      - uses: ./.github/actions/upload_awx_devel_logs
+        if: always()
+        with:
+          log-filename: live-tests.log
 
   awx-operator:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DEBUG_OUTPUT_DIR: /tmp/awx_operator_molecule_test
     steps:
       - name: Checkout awx
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
+          show-progress: false
           path: awx
 
-      - name: Checkout awx-operator
-        uses: actions/checkout@v2
+      - uses: ./awx/.github/actions/setup-ssh-agent
         with:
+          ssh-private-key: ${{ secrets.PRIVATE_GITHUB_KEY }}
+
+      - name: Checkout awx-operator
+        uses: actions/checkout@v4
+        with:
+          show-progress: false\
           repository: ansible/awx-operator
           path: awx-operator
 
+      - name: Setup python, referencing action at awx relative path
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+
       - name: Install playbook dependencies
         run: |
-          python3 -m pip install docker
+          python -m pip install docker
 
+      - name: Check Python version
+        working-directory: awx
+        run: |
+          make print-PYTHON
+      
       - name: Build AWX image
         working-directory: awx
         run: |
-          ansible-playbook -v tools/ansible/build.yml \
-            -e headless=yes \
-            -e awx_image=awx \
-            -e awx_image_tag=ci \
-            -e ansible_python_interpreter=$(which python3)
+          VERSION=`make version-for-buildyml` make awx-kube-build
+        env:
+          COMPOSE_TAG: ci
+          DEV_DOCKER_TAG_BASE: local
+          HEADLESS: yes
 
       - name: Run test deployment with awx-operator
         working-directory: awx-operator
+        id: awx_operator_test
+        timeout-minutes: 60
+        continue-on-error: true
         run: |
-          python3 -m pip install -r molecule/requirements.txt
-          ansible-galaxy collection install -r molecule/requirements.yml
-          sudo rm -f $(which kustomize)
-          make kustomize
-          KUSTOMIZE_PATH=$(readlink -f bin/kustomize) molecule -v test -s kind
+          set +e
+          timeout 15m bash -elc '
+            python -m pip install -r molecule/requirements.txt
+            python -m pip install PyYAML # for awx/tools/scripts/rewrite-awx-operator-requirements.py
+            $(realpath ../awx/tools/scripts/rewrite-awx-operator-requirements.py) molecule/requirements.yml $(realpath ../awx)
+            ansible-galaxy collection install -r molecule/requirements.yml
+            sudo rm -f $(which kustomize)
+            make kustomize
+            KUSTOMIZE_PATH=$(readlink -f bin/kustomize) molecule -v test -s kind -- --skip-tags=replicas
+          '
+          rc=$?
+          if [ $rc -eq 124 ]; then
+            echo "timed_out=true" >> "$GITHUB_OUTPUT"
+          fi
+          exit $rc
         env:
-          AWX_TEST_IMAGE: awx
+          AWX_TEST_IMAGE: local/awx
           AWX_TEST_VERSION: ci
+          AWX_EE_TEST_IMAGE: quay.io/ansible/awx-ee:latest
+          STORE_DEBUG_OUTPUT: true
+
+      - name: Collect awx-operator logs on timeout
+        # Only run on timeout; normal failures should use molecule's built-in log collection.
+        if: steps.awx_operator_test.outputs.timed_out == 'true'
+        run: |
+          mkdir -p "$DEBUG_OUTPUT_DIR"
+          if command -v kind >/dev/null 2>&1; then
+            for cluster in $(kind get clusters 2>/dev/null); do
+              kind export logs "$DEBUG_OUTPUT_DIR/$cluster" --name "$cluster" || true
+            done
+          fi
+          if command -v kubectl >/dev/null 2>&1; then
+            kubectl get all -A -o wide > "$DEBUG_OUTPUT_DIR/kubectl-get-all.txt" || true
+            kubectl get pods -A -o wide > "$DEBUG_OUTPUT_DIR/kubectl-get-pods.txt" || true
+            kubectl describe pods -A > "$DEBUG_OUTPUT_DIR/kubectl-describe-pods.txt" || true
+          fi
+          docker ps -a > "$DEBUG_OUTPUT_DIR/docker-ps.txt" || true
+
+      - name: Upload debug output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: awx-operator-debug-output
+          path: ${{ env.DEBUG_OUTPUT_DIR }}
+
+      - name: Fail awx-operator check if test deployment failed
+        if: steps.awx_operator_test.outcome != 'success'
+        run: exit 1
+
+  collection-sanity:
+    name: awx_collection sanity
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        ansible:
+          - stable-2.17
+          # - devel
+    steps:
+      - name: Perform sanity testing
+        uses: ansible-community/ansible-test-gh-action@release/v1
+        with:
+          ansible-core-version: ${{ matrix.ansible }}
+          codecov-token: ${{ secrets.CODECOV_TOKEN }}
+          collection-root: awx_collection
+          pre-test-cmd: >-
+            ansible-playbook
+            -i localhost,
+            tools/template_galaxy.yml
+            -e collection_package=awx
+            -e collection_namespace=awx
+            -e collection_version=1.0.0
+            -e '{"awx_template_version": false}'
+          testing-type: sanity
+
+      - name: Upload awx jUnit test reports to the unified dashboard
+        if: >-
+          !cancelled()
+          && steps.make-run.outputs.test-result-files != ''
+          && github.event_name == 'push'
+          && env.UPSTREAM_REPOSITORY_ID == github.repository_id
+          && github.ref_name == github.event.repository.default_branch
+        uses: ansible/gh-action-record-test-results@3784db66a1b7fb3809999a7251c8a7203a7ffbe8
+        with:
+          aggregation-server-url: ${{ vars.PDE_ORG_RESULTS_AGGREGATOR_UPLOAD_URL }}
+          http-auth-password: >-
+            ${{ secrets.PDE_ORG_RESULTS_UPLOAD_PASSWORD }}
+          http-auth-username: >-
+            ${{ vars.PDE_ORG_RESULTS_AGGREGATOR_UPLOAD_USER }}
+          project-component-name: awx
+          test-result-files: >-
+            ${{ steps.make-run.outputs.test-result-files }}
+
+  collection-integration:
+    name: awx_collection integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target-regex:
+          - name: a-h
+            regex: ^[a-h]
+          - name: i-p
+            regex: ^[i-p]
+          - name: r-z0-9
+            regex: ^[r-z0-9]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          show-progress: false
+
+      - uses: ./.github/actions/setup-python
+        with:
+          python-version: '3.13'
+
+      - name: Remove system ansible to avoid conflicts
+        run: |
+          python -m pip uninstall -y ansible ansible-core || true
+
+      - uses: ./.github/actions/run_awx_devel
+        id: awx
+        with:
+          build-ui: false
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          private-github-key: ${{ secrets.PRIVATE_GITHUB_KEY }}
+
+      - name: Install dependencies for running tests
+        run: |
+          python -m pip install -e ./awxkit/
+          python -m pip install -r awx_collection/requirements.txt
+          hash -r  # Rehash to pick up newly installed scripts
+
+      - name: Run integration tests
+        id: make-run
+        run: |
+          echo "::remove-matcher owner=python::"  # Disable annoying annotations from setup-python
+          echo '[general]' > ~/.tower_cli.cfg
+          echo 'host = https://${{ steps.awx.outputs.ip }}:8043' >> ~/.tower_cli.cfg
+          echo 'username = admin' >> ~/.tower_cli.cfg
+          echo 'password = password' >> ~/.tower_cli.cfg
+          echo 'verify_ssl = false' >> ~/.tower_cli.cfg
+          TARGETS="$(ls awx_collection/tests/integration/targets | grep '${{ matrix.target-regex.regex }}' | tr '\n' ' ')"
+          export PYTHONPATH="$(python -c 'import site; print(":".join(site.getsitepackages()))')${PYTHONPATH:+:$PYTHONPATH}"
+          make COLLECTION_VERSION=100.100.100-git COLLECTION_TEST_TARGET="--requirements $TARGETS" test_collection_integration
+        env:
+          ANSIBLE_TEST_PREFER_PODMAN: 1
+
+      - name: Upload test coverage to Codecov
+        if: >-
+          !cancelled()
+          && steps.make-run.outputs.cov-report-files != ''
+        uses: codecov/codecov-action@v4
+        with:
+          fail_ci_if_error: >-
+            ${{
+              toJSON(env.UPSTREAM_REPOSITORY_ID == github.repository_id)
+            }}
+          files: >-
+            ${{ steps.make-run.outputs.cov-report-files }}
+          flags: >-
+            CI-GHA,
+            ansible-test,
+            integration,
+            OS-${{
+              runner.os
+            }}
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      # Upload coverage report as artifact
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-${{ matrix.target-regex.name }}
+          path: ~/.ansible/collections/ansible_collections/awx/awx/tests/output/coverage/
+          retention-days: 1
+
+      - uses: ./.github/actions/upload_awx_devel_logs
+        if: always()
+        with:
+          log-filename: collection-integration-${{ matrix.target-regex.name }}.log
+
+  collection-integration-coverage-combine:
+    name: combine awx_collection integration coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs:
+      - collection-integration
+    strategy:
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          show-progress: false
+
+      - uses: ./.github/actions/setup-python
+        with:
+          python-version: '3.13'
+
+      - name: Remove system ansible to avoid conflicts
+        run: |
+          python -m pip uninstall -y ansible ansible-core || true
+
+      - name: Upgrade ansible-core
+        run: python -m pip install --upgrade ansible-core
+
+      - name: Download coverage artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: coverage
+          pattern: coverage-*
+
+      - name: Combine coverage
+        run: |
+          make COLLECTION_VERSION=100.100.100-git install_collection
+          mkdir -p ~/.ansible/collections/ansible_collections/awx/awx/tests/output/coverage
+          cp -rv coverage/* ~/.ansible/collections/ansible_collections/awx/awx/tests/output/coverage/
+          cd ~/.ansible/collections/ansible_collections/awx/awx
+          hash -r  # Rehash to pick up newly installed scripts
+          PATH="$(python -c 'import sys; import os; print(os.path.dirname(sys.executable))'):$PATH" ansible-test coverage combine --requirements
+          PATH="$(python -c 'import sys; import os; print(os.path.dirname(sys.executable))'):$PATH" ansible-test coverage html
+          echo '## AWX Collection Integration Coverage' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          PATH="$(python -c 'import sys; import os; print(os.path.dirname(sys.executable))'):$PATH" ansible-test coverage report >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo >> $GITHUB_STEP_SUMMARY
+          echo '## AWX Collection Integration Coverage HTML' >> $GITHUB_STEP_SUMMARY
+          echo 'Download the HTML artifacts to view the coverage report.' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload coverage report as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: awx-collection-integration-coverage-html
+          path: ~/.ansible/collections/ansible_collections/awx/awx/tests/output/reports/coverage

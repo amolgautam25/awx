@@ -1,22 +1,28 @@
+import logging
+
 # Python
 import pytest
 from unittest import mock
-import tempfile
-import shutil
 import urllib.parse
 from unittest.mock import PropertyMock
+import importlib
 
 # Django
 from django.urls import resolve
 from django.http import Http404
+from django.apps import apps as global_apps
 from django.core.handlers.exception import response_for_exception
 from django.contrib.auth.models import User
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db.backends.sqlite3.base import SQLiteCursorWrapper
 
+from django.db.models.signals import post_migrate
+
+from awx.main.migrations._dab_rbac import setup_managed_role_definitions
+
 # AWX
 from awx.main.models.projects import Project
-from awx.main.models.ha import Instance
+from awx.main.models.ha import Instance, InstanceGroup
 
 from rest_framework.test import (
     APIRequestFactory,
@@ -30,7 +36,6 @@ from awx.main.models.organization import (
     Organization,
     Team,
 )
-from awx.main.models.rbac import Role
 from awx.main.models.notifications import NotificationTemplate, Notification
 from awx.main.models.events import (
     JobEvent,
@@ -41,15 +46,80 @@ from awx.main.models.events import (
 )
 from awx.main.models.workflow import WorkflowJobTemplate
 from awx.main.models.ad_hoc_commands import AdHocCommand
-from awx.main.models.oauth import OAuth2Application as Application
 from awx.main.models.execution_environments import ExecutionEnvironment
+from awx.main.utils import is_testing
+
+logger = logging.getLogger(__name__)
 
 __SWAGGER_REQUESTS__ = {}
+
+
+# HACK: the dab_resource_registry app required ServiceID in migrations which checks do not run
+dab_rr_initial = importlib.import_module('ansible_base.resource_registry.migrations.0001_initial')
+
+
+def create_service_id(app_config, apps=global_apps, **kwargs):
+    try:
+        apps.get_model("dab_resource_registry", "ServiceID")
+    except LookupError:
+        logger.info('Looks like reverse migration, not creating resource registry ServiceID')
+        return
+    dab_rr_initial.create_service_id(apps, None)
+
+
+if is_testing():
+    post_migrate.connect(create_service_id)
 
 
 @pytest.fixture(scope="session")
 def swagger_autogen(requests=__SWAGGER_REQUESTS__):
     return requests
+
+
+class FakeRedis:
+    def __init__(self, *args, **kwargs):
+        # Accept and ignore all arguments to match redis.Redis signature
+        pass
+
+    def keys(self, *args, **kwargs):
+        return []
+
+    def set(self, *args, **kwargs):
+        pass
+
+    def get(self, *args, **kwargs):
+        return None
+
+    def rpush(self, *args, **kwargs):
+        return 1
+
+    def blpop(self, *args, **kwargs):
+        return None
+
+    def delete(self, *args, **kwargs):
+        pass
+
+    def llen(self, *args, **kwargs):
+        return 0
+
+    def scan_iter(self, *args, **kwargs):
+        return iter([])
+
+    @classmethod
+    def from_url(cls, *args, **kwargs):
+        return cls()
+
+    def pipeline(self):
+        return self
+
+    def ping(self):
+        return
+
+
+@pytest.fixture
+def fake_redis():
+    with mock.patch('redis.Redis', new=FakeRedis):  # turn off redis stuff
+        yield
 
 
 @pytest.fixture
@@ -80,6 +150,17 @@ def deploy_jobtemplate(project, inventory, credential):
     return jt
 
 
+@pytest.fixture()
+def execution_environment():
+    return ExecutionEnvironment.objects.create(name="test-ee", description="test-ee", managed=True)
+
+
+@pytest.fixture
+def setup_managed_roles():
+    "Run the migration script to pre-create managed role definitions"
+    setup_managed_role_definitions(global_apps, None)
+
+
 @pytest.fixture
 def team(organization):
     return organization.teams.create(name='test-team')
@@ -90,20 +171,6 @@ def team_member(user, team):
     ret = user('team-member', False)
     team.member_role.members.add(ret)
     return ret
-
-
-@pytest.fixture(scope="session", autouse=True)
-def project_playbooks():
-    """
-    Return playbook_files as playbooks for manual projects when testing.
-    """
-
-    class PlaybooksMock(mock.PropertyMock):
-        def __get__(self, obj, obj_type):
-            return obj.playbook_files
-
-    mocked = mock.patch.object(Project, 'playbooks', new_callable=PlaybooksMock)
-    mocked.start()
 
 
 @pytest.fixture
@@ -176,12 +243,6 @@ def team_factory(organization):
         return t
 
     return factory
-
-
-@pytest.fixture
-def user_project(user):
-    owner = user('owner')
-    return Project.objects.create(name="test-user-project", created_by=owner, description="test-user-project-desc")
 
 
 @pytest.fixture
@@ -334,22 +395,13 @@ def inventory(organization):
 
 
 @pytest.fixture
-def insights_inventory(inventory):
-    inventory.scm_type = 'insights'
-    inventory.save()
-    return inventory
-
-
-@pytest.fixture
 def scm_inventory_source(inventory, project):
     inv_src = InventorySource(
         name="test-scm-inv",
         source_project=project,
         source='scm',
         source_path='inventory_file',
-        update_on_project_update=True,
         inventory=inventory,
-        scm_last_revision=project.scm_revision,
     )
     with mock.patch('awx.main.models.unified_jobs.UnifiedJobTemplate.update'):
         inv_src.save()
@@ -425,7 +477,7 @@ def admin(user):
 @pytest.fixture
 def system_auditor(user):
     u = user('an-auditor', False)
-    Role.singleton('system_auditor').members.add(u)
+    u.is_system_auditor = True
     return u
 
 
@@ -492,25 +544,16 @@ def group_factory(inventory):
 
 
 @pytest.fixture
-def hosts(group_factory):
-    group1 = group_factory('group-1')
-
-    def rf(host_count=1):
-        hosts = []
-        for i in range(0, host_count):
-            name = '%s-host-%s' % (group1.name, i)
-            (host, created) = group1.inventory.hosts.get_or_create(name=name)
-            if created:
-                group1.hosts.add(host)
-            hosts.append(host)
-        return hosts
-
-    return rf
+def group(inventory):
+    return inventory.groups.create(name='single-group')
 
 
 @pytest.fixture
-def group(inventory):
-    return inventory.groups.create(name='single-group')
+def constructed_inventory(organization):
+    """
+    creates a new constructed inventory source
+    """
+    return Inventory.objects.create(name='dummy1', kind='constructed', organization=organization)
 
 
 @pytest.fixture
@@ -707,8 +750,13 @@ def jt_linked(organization, project, inventory, machine_credential, credential, 
 
 
 @pytest.fixture
+def instance_group():
+    return InstanceGroup.objects.create(name="east")
+
+
+@pytest.fixture
 def workflow_job_template(organization):
-    wjt = WorkflowJobTemplate(name='test-workflow_job_template', organization=organization)
+    wjt = WorkflowJobTemplate.objects.create(name='test-workflow_job_template', organization=organization)
     wjt.save()
 
     return wjt
@@ -737,6 +785,30 @@ def system_job_factory(system_job_template, admin):
     return factory
 
 
+@pytest.fixture
+def wfjt(workflow_job_template_factory, organization):
+    objects = workflow_job_template_factory('test_workflow', organization=organization, persisted=True)
+    return objects.workflow_job_template
+
+
+@pytest.fixture
+def wfjt_with_nodes(workflow_job_template_factory, organization, job_template):
+    objects = workflow_job_template_factory(
+        'test_workflow', organization=organization, workflow_job_template_nodes=[{'unified_job_template': job_template}], persisted=True
+    )
+    return objects.workflow_job_template
+
+
+@pytest.fixture
+def wfjt_node(wfjt_with_nodes):
+    return wfjt_with_nodes.workflow_job_template_nodes.all()[0]
+
+
+@pytest.fixture
+def workflow_job(wfjt):
+    return wfjt.workflow_jobs.create(name='test_workflow')
+
+
 def dumps(value):
     return DjangoJSONEncoder().encode(value)
 
@@ -754,30 +826,43 @@ def get_db_prep_save(self, value, connection, **kwargs):
     return value
 
 
-@pytest.fixture
-def oauth_application(admin):
-    return Application.objects.create(name='test app', user=admin, client_type='confidential', authorization_grant_type='password')
+class MockCopy:
+    events = []
+    index = -1
 
-
-@pytest.fixture
-def sqlite_copy_expert(request):
-    # copy_expert is postgres-specific, and SQLite doesn't support it; mock its
-    # behavior to test that it writes a file that contains stdout from events
-    path = tempfile.mkdtemp(prefix='job-event-stdout')
-
-    def write_stdout(self, sql, fd):
-        # simulate postgres copy_expert support with ORM code
+    def __init__(self, sql):
+        self.events = []
         parts = sql.split(' ')
         tablename = parts[parts.index('from') + 1]
         for cls in (JobEvent, AdHocCommandEvent, ProjectUpdateEvent, InventoryUpdateEvent, SystemJobEvent):
             if cls._meta.db_table == tablename:
                 for event in cls.objects.order_by('start_line').all():
-                    fd.write(event.stdout)
+                    self.events.append(event.stdout)
 
-    setattr(SQLiteCursorWrapper, 'copy_expert', write_stdout)
-    request.addfinalizer(lambda: shutil.rmtree(path))
-    request.addfinalizer(lambda: delattr(SQLiteCursorWrapper, 'copy_expert'))
-    return path
+    def read(self):
+        self.index = self.index + 1
+        if self.index < len(self.events):
+            return memoryview(self.events[self.index].encode())
+
+        return None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+
+@pytest.fixture
+def sqlite_copy(request, mocker):
+    # copy is postgres-specific, and SQLite doesn't support it; mock its
+    # behavior to test that it writes a file that contains stdout from events
+
+    def write_stdout(self, sql):
+        mock_copy = MockCopy(sql)
+        return mock_copy
+
+    mocker.patch.object(SQLiteCursorWrapper, 'copy', write_stdout, create=True)
 
 
 @pytest.fixture

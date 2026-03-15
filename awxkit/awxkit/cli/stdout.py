@@ -6,10 +6,11 @@ import sys
 import time
 
 from .utils import cprint, color_enabled, STATUS_COLORS
+from awxkit.config import config
 from awxkit.utils import to_str
 
 
-def monitor_workflow(response, session, print_stdout=True, timeout=None, interval=0.25):
+def monitor_workflow(response, session, print_stdout=True, action_timeout=None, interval=5):
     get = response.url.get
     payload = {
         'order_by': 'finished',
@@ -17,7 +18,7 @@ def monitor_workflow(response, session, print_stdout=True, timeout=None, interva
     }
 
     def fetch(seen):
-        results = response.connection.get('/api/v2/unified_jobs', payload).json()['results']
+        results = response.connection.get(f"{config.api_base_path}v2/unified_jobs", payload).json()['results']
 
         # erase lines we've previously printed
         if print_stdout and sys.stdout.isatty():
@@ -46,9 +47,9 @@ def monitor_workflow(response, session, print_stdout=True, timeout=None, interva
     started = time.time()
     seen = set()
     while True:
-        if timeout and time.time() - started > timeout:
+        if action_timeout and time.time() - started > action_timeout:
             if print_stdout:
-                cprint('Monitoring aborted due to timeout.', 'red')
+                cprint('Monitoring aborted due to action-timeout.', 'red')
             break
 
         if sys.stdout.isatty():
@@ -58,7 +59,7 @@ def monitor_workflow(response, session, print_stdout=True, timeout=None, interva
             # all at the end
             fetch(seen)
 
-        time.sleep(0.25)
+        time.sleep(max(2.5, interval))
         json = get().json
         if json.finished:
             fetch(seen)
@@ -68,7 +69,7 @@ def monitor_workflow(response, session, print_stdout=True, timeout=None, interva
     return get().json.status
 
 
-def monitor(response, session, print_stdout=True, timeout=None, interval=0.25):
+def monitor(response, session, print_stdout=True, action_timeout=None, interval=5):
     get = response.url.get
     payload = {'order_by': 'start_line', 'no_truncate': True}
     if response.type == 'job':
@@ -97,15 +98,15 @@ def monitor(response, session, print_stdout=True, timeout=None, interval=0.25):
 
     started = time.time()
     while True:
-        if timeout and time.time() - started > timeout:
+        if action_timeout and time.time() - started > action_timeout:
             if print_stdout:
-                cprint('Monitoring aborted due to timeout.', 'red')
+                cprint('Monitoring aborted due to action-timeout.', 'red')
             break
         next_line = fetch(next_line)
         if next_line:
             payload['start_line__gte'] = next_line
 
-        time.sleep(0.25)
+        time.sleep(max(2.5, interval))
         json = get().json
         if json.event_processing_finished is True or json.status in ('error', 'canceled'):
             fetch(next_line)

@@ -27,7 +27,7 @@ options:
         - project
     organization:
       description:
-        - Organization the project exists in.
+        - Organization name, ID, or named URL the project exists in.
         - Used to help lookup the object, cannot be modified using this module.
         - If not provided, will lookup by name only, which does not work with duplicates.
       type: str
@@ -41,7 +41,7 @@ options:
       description:
         - The interval to request an update from the controller.
       required: False
-      default: 1
+      default: 2
       type: float
     timeout:
       description:
@@ -74,7 +74,7 @@ EXAMPLES = '''
 - name: Launch a Project with extra_vars without waiting
   project_update:
     project: "Networking Project"
-    wait: False
+    wait: false
 '''
 
 from ..module_utils.controller_api import ControllerAPIModule
@@ -86,8 +86,8 @@ def main():
         name=dict(required=True, aliases=['project']),
         organization=dict(),
         wait=dict(default=True, type='bool'),
-        interval=dict(default=1.0, type='float'),
-        timeout=dict(default=None, type='int'),
+        interval=dict(default=2.0, type='float'),
+        timeout=dict(type='int'),
     )
 
     # Create a module for ourselves
@@ -114,7 +114,11 @@ def main():
     # Update the project
     result = module.post_endpoint(project['related']['update'])
 
-    if result['status_code'] != 202:
+    if result['status_code'] == 405:
+        module.fail_json(
+            msg="Unable to trigger a project update because the project scm_type ({0}) does not support it.".format(project['scm_type']), response=result
+        )
+    elif result['status_code'] != 202:
         module.fail_json(msg="Failed to update project, see response for details", response=result)
 
     module.json_output['changed'] = True

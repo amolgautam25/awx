@@ -17,29 +17,59 @@ import pytest
 
 from ansible.module_utils.six import raise_from
 
+from ansible_base.rbac.models import RoleDefinition, DABPermission
+from ansible_base.rbac import permission_registry
+
+from awx.main.tests.conftest import load_all_credentials  # noqa: F401; pylint: disable=unused-import
 from awx.main.tests.functional.conftest import _request
-from awx.main.models import Organization, Project, Inventory, JobTemplate, Credential, CredentialType, ExecutionEnvironment, UnifiedJob
+from awx.main.tests.functional.conftest import credentialtype_scm, credentialtype_ssh  # noqa: F401; pylint: disable=unused-import
+from awx.main.models import (
+    Organization,
+    Project,
+    Inventory,
+    JobTemplate,
+    Credential,
+    CredentialType,
+    ExecutionEnvironment,
+    UnifiedJob,
+    WorkflowJobTemplate,
+    NotificationTemplate,
+    Schedule,
+    Team,
+)
 
 from django.db import transaction
 
-try:
-    import tower_cli  # noqa
 
-    HAS_TOWER_CLI = True
-except ImportError:
-    HAS_TOWER_CLI = False
-
-try:
-    # Because awxkit will be a directory at the root of this makefile and we are using python3, import awxkit will work even if its not installed.
-    # However, awxkit will not contain api whih causes a stack failure down on line 170 when we try to mock it.
-    # So here we are importing awxkit.api to prevent that. Then you only get an error on tests for awxkit functionality.
-    import awxkit.api  # noqa
-
-    HAS_AWX_KIT = True
-except ImportError:
-    HAS_AWX_KIT = False
-
+HAS_TOWER_CLI = False
+HAS_AWX_KIT = False
 logger = logging.getLogger('awx.main.tests')
+
+
+@pytest.fixture(autouse=True)
+def awxkit_path_set(monkeypatch):
+    """Monkey patch sys.path, insert awxkit source code so that
+    the package does not need to be installed.
+    """
+    base_folder = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, os.pardir, 'awxkit'))
+    monkeypatch.syspath_prepend(base_folder)
+
+
+@pytest.fixture(autouse=True)
+def import_awxkit():
+    global HAS_TOWER_CLI
+    global HAS_AWX_KIT
+    try:
+        import tower_cli  # noqa
+        HAS_TOWER_CLI = True
+    except ImportError:
+        HAS_TOWER_CLI = False
+
+    try:
+        import awxkit  # noqa
+        HAS_AWX_KIT = True
+    except ImportError:
+        HAS_AWX_KIT = False
 
 
 def sanitize_dict(din):
@@ -86,35 +116,91 @@ def collection_import():
     return rf
 
 
+def _process_request_data(kwargs_copy, kwargs):
+    """Helper to process 'data' in request kwargs."""
+    if 'data' in kwargs:
+        if isinstance(kwargs['data'], dict):
+            kwargs_copy['data'] = kwargs['data']
+        elif kwargs['data'] is None:
+            pass
+        elif isinstance(kwargs['data'], str):
+            kwargs_copy['data'] = json.loads(kwargs['data'])
+        else:
+            raise RuntimeError('Expected data to be dict or str, got {0}, data: {1}'.format(type(kwargs['data']), kwargs['data']))
+
+
+def _process_request_params(kwargs_copy, kwargs, method):
+    """Helper to process 'params' in request kwargs."""
+    if 'params' in kwargs and method == 'GET':
+        if not kwargs_copy.get('data'):
+            kwargs_copy['data'] = {}
+        if isinstance(kwargs['params'], dict):
+            kwargs_copy['data'].update(kwargs['params'])
+        elif isinstance(kwargs['params'], list):
+            for k, v in kwargs['params']:
+                kwargs_copy['data'][k] = v
+
+
+def _get_resource_class(resource_module):
+    """Helper to determine the Ansible module resource class."""
+    if getattr(resource_module, 'ControllerAWXKitModule', None):
+        return resource_module.ControllerAWXKitModule
+    elif getattr(resource_module, 'ControllerAPIModule', None):
+        return resource_module.ControllerAPIModule
+    else:
+        raise RuntimeError("The module has neither a ControllerAWXKitModule or a ControllerAPIModule")
+
+
+def _get_tower_cli_mgr(new_request):
+    """Helper to get the appropriate tower_cli mock context manager."""
+    if HAS_TOWER_CLI:
+        return mock.patch('tower_cli.api.Session.request', new=new_request)
+    elif HAS_AWX_KIT:
+        return mock.patch('awxkit.api.client.requests.Session.request', new=new_request)
+    else:
+        return suppress()
+
+
+def _run_and_capture_module_output(resource_module, stdout_buffer):
+    """Helper to run the module and capture its stdout."""
+    try:
+        with redirect_stdout(stdout_buffer):
+            resource_module.main()
+    except SystemExit:
+        pass  # A system exit indicates successful execution
+    except Exception:
+        # dump the stdout back to console for debugging
+        print(stdout_buffer.getvalue())
+        raise
+
+
+def _parse_and_handle_module_result(module_stdout):
+    """Helper to parse module output and handle exceptions."""
+    try:
+        result = json.loads(module_stdout)
+    except Exception as e:
+        raise_from(Exception('Module did not write valid JSON, error: {0}, stdout:\n{1}'.format(str(e), module_stdout)), e)
+
+    if 'exception' in result:
+        if "ModuleNotFoundError: No module named 'tower_cli'" in result['exception']:
+            pytest.skip('The tower-cli library is needed to run this test, module no longer supported.')
+        raise Exception('Module encountered error:\n{0}'.format(result['exception']))
+    return result
+
+
 @pytest.fixture
-def run_module(request, collection_import):
+def run_module(request, collection_import, mocker):
     def rf(module_name, module_params, request_user):
+
         def new_request(self, method, url, **kwargs):
             kwargs_copy = kwargs.copy()
-            if 'data' in kwargs:
-                if isinstance(kwargs['data'], dict):
-                    kwargs_copy['data'] = kwargs['data']
-                elif kwargs['data'] is None:
-                    pass
-                elif isinstance(kwargs['data'], str):
-                    kwargs_copy['data'] = json.loads(kwargs['data'])
-                else:
-                    raise RuntimeError('Expected data to be dict or str, got {0}, data: {1}'.format(type(kwargs['data']), kwargs['data']))
-            if 'params' in kwargs and method == 'GET':
-                # query params for GET are handled a bit differently by
-                # tower-cli and python requests as opposed to REST framework APIRequestFactory
-                if not kwargs_copy.get('data'):
-                    kwargs_copy['data'] = {}
-                if isinstance(kwargs['params'], dict):
-                    kwargs_copy['data'].update(kwargs['params'])
-                elif isinstance(kwargs['params'], list):
-                    for k, v in kwargs['params']:
-                        kwargs_copy['data'][k] = v
+            _process_request_data(kwargs_copy, kwargs)
+            _process_request_params(kwargs_copy, kwargs, method)
 
             # make request
             with transaction.atomic():
-                rf = _request(method.lower())
-                django_response = rf(url, user=request_user, expect=None, **kwargs_copy)
+                rf_django = _request(method.lower())  # Renamed rf to avoid conflict with outer rf
+                django_response = rf_django(url, user=request_user, expect=None, **kwargs_copy)
 
             # requests library response object is different from the Django response, but they are the same concept
             # this converts the Django response object into a requests response object for consumption
@@ -123,7 +209,7 @@ def run_module(request, collection_import):
             sanitize_dict(py_data)
             resp._content = bytes(json.dumps(django_response.data), encoding='utf8')
             resp.status_code = django_response.status_code
-            resp.headers = {'X-API-Product-Name': 'AWX', 'X-API-Product-Version': '0.0.1-devel'}
+            resp.headers = dict(django_response.headers)
 
             if request.config.getoption('verbose') > 0:
                 logger.info('%s %s by %s, code:%s', method, '/api/' + url.split('/api/')[1], request_user.username, resp.status_code)
@@ -138,60 +224,25 @@ def run_module(request, collection_import):
             return m
 
         stdout_buffer = io.StringIO()
-        # Requies specific PYTHONPATH, see docs
-        # Note that a proper Ansiballz explosion of the modules will have an import path like:
-        # ansible_collections.awx.awx.plugins.modules.{}
-        # We should consider supporting that in the future
         resource_module = collection_import('plugins.modules.{0}'.format(module_name))
 
         if not isinstance(module_params, dict):
             raise RuntimeError('Module params must be dict, got {0}'.format(type(module_params)))
 
-        # Ansible params can be passed as an invocation argument or over stdin
-        # this short circuits within the AnsibleModule interface
         def mock_load_params(self):
             self.params = module_params
 
-        if getattr(resource_module, 'ControllerAWXKitModule', None):
-            resource_class = resource_module.ControllerAWXKitModule
-        elif getattr(resource_module, 'ControllerAPIModule', None):
-            resource_class = resource_module.ControllerAPIModule
-        elif getattr(resource_module, 'TowerLegacyModule', None):
-            resource_class = resource_module.TowerLegacyModule
-        else:
-            raise ("The module has neither a TowerLegacyModule, ControllerAWXKitModule or a ControllerAPIModule")
+        resource_class = _get_resource_class(resource_module)
 
         with mock.patch.object(resource_class, '_load_params', new=mock_load_params):
-            # Call the test utility (like a mock server) instead of issuing HTTP requests
+            mocker.patch('ansible.module_utils.basic._ANSIBLE_PROFILE', 'legacy')
+
             with mock.patch('ansible.module_utils.urls.Request.open', new=new_open):
-                if HAS_TOWER_CLI:
-                    tower_cli_mgr = mock.patch('tower_cli.api.Session.request', new=new_request)
-                elif HAS_AWX_KIT:
-                    tower_cli_mgr = mock.patch('awxkit.api.client.requests.Session.request', new=new_request)
-                else:
-                    tower_cli_mgr = suppress()
-                with tower_cli_mgr:
-                    try:
-                        # Ansible modules return data to the mothership over stdout
-                        with redirect_stdout(stdout_buffer):
-                            resource_module.main()
-                    except SystemExit:
-                        pass  # A system exit indicates successful execution
-                    except Exception:
-                        # dump the stdout back to console for debugging
-                        print(stdout_buffer.getvalue())
-                        raise
+                with _get_tower_cli_mgr(new_request):
+                    _run_and_capture_module_output(resource_module, stdout_buffer)
 
         module_stdout = stdout_buffer.getvalue().strip()
-        try:
-            result = json.loads(module_stdout)
-        except Exception as e:
-            raise_from(Exception('Module did not write valid JSON, error: {0}, stdout:\n{1}'.format(str(e), module_stdout)), e)
-        # A module exception should never be a test expectation
-        if 'exception' in result:
-            if "ModuleNotFoundError: No module named 'tower_cli'" in result['exception']:
-                pytest.skip('The tower-cli library is needed to run this test, module no longer supported.')
-            raise Exception('Module encountered error:\n{0}'.format(result['exception']))
+        result = _parse_and_handle_module_result(module_stdout)
         return result
 
     return rf
@@ -236,10 +287,13 @@ def job_template(project, inventory):
 
 
 @pytest.fixture
-def machine_credential(organization):
-    ssh_type = CredentialType.defaults['ssh']()
-    ssh_type.save()
-    return Credential.objects.create(credential_type=ssh_type, name='machine-cred', inputs={'username': 'test_user', 'password': 'pas4word'})
+def team(organization):
+    return Team.objects.create(name='test-team', organization=organization)
+
+
+@pytest.fixture
+def machine_credential(credentialtype_ssh, organization):  # noqa: F811
+    return Credential.objects.create(credential_type=credentialtype_ssh, name='machine-cred', inputs={'username': 'test_user', 'password': 'pas4word'})
 
 
 @pytest.fixture
@@ -253,9 +307,7 @@ def vault_credential(organization):
 def kube_credential():
     ct = CredentialType.defaults['kubernetes_bearer_token']()
     ct.save()
-    return Credential.objects.create(
-        credential_type=ct, name='kube-cred', inputs={'host': 'my.cluster', 'bearer_token': 'my-token', 'verify_ssl': False}
-    )
+    return Credential.objects.create(credential_type=ct, name='kube-cred', inputs={'host': 'my.cluster', 'bearer_token': 'my-token', 'verify_ssl': False})
 
 
 @pytest.fixture
@@ -288,3 +340,51 @@ def mock_has_unpartitioned_events():
     # We mock this out to circumvent the migration query.
     with mock.patch.object(UnifiedJob, 'has_unpartitioned_events', new=False) as _fixture:
         yield _fixture
+
+
+@pytest.fixture
+def workflow_job_template(organization, inventory):
+    return WorkflowJobTemplate.objects.create(name='test-workflow_job_template', organization=organization, inventory=inventory)
+
+
+@pytest.fixture
+def notification_template(organization):
+    return NotificationTemplate.objects.create(
+        name='test-notification_template',
+        organization=organization,
+        notification_type="webhook",
+        notification_configuration=dict(
+            url="http://localhost",
+            username="",
+            password="",
+            headers={
+                "Test": "Header",
+            },
+        ),
+    )
+
+
+@pytest.fixture
+def job_template_role_definition():
+    rd = RoleDefinition.objects.create(name='test_view_jt', content_type=permission_registry.content_type_model.objects.get_for_model(JobTemplate))
+    permission_codenames = ['view_jobtemplate', 'execute_jobtemplate']
+    permissions = DABPermission.objects.filter(codename__in=permission_codenames)
+    rd.permissions.add(*permissions)
+    return rd
+
+
+@pytest.fixture
+def scm_credential(credentialtype_scm, organization):  # noqa: F811
+    return Credential.objects.create(
+        credential_type=credentialtype_scm, name='scm-cred', inputs={'username': 'optimus', 'password': 'prime'}, organization=organization
+    )
+
+
+@pytest.fixture
+def rrule():
+    return 'DTSTART:20151117T050000Z RRULE:FREQ=DAILY;INTERVAL=1;COUNT=1'
+
+
+@pytest.fixture
+def schedule(job_template, rrule):
+    return Schedule.objects.create(unified_job_template=job_template, name='test-sched', rrule=rrule)

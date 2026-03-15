@@ -1,40 +1,30 @@
-<!--- changelog-entry
-# Fill in 'msg' below to have an entry automatically added to the next release changelog.
-# Leaving 'msg' blank will not generate a changelog entry for this PR.
-# Please ensure this is a simple (and readable) one-line string.
----
-msg: ""
--->
-
 ##### SUMMARY
 <!--- Describe the change, including rationale and design decisions -->
 
 <!---
 If you are fixing an existing issue, please include "related #nnn" in your
 commit message and your description; but you should still explain what
-the change does.
+the change does. Also please make sure that if this PR has an attached JIRA, put AAP-<number>
+in as the first entry for your PR title.
 -->
 
 ##### ISSUE TYPE
 <!--- Pick one below and delete the rest: -->
- - Feature Pull Request
- - Bugfix Pull Request
- - Docs Pull Request
+ - Breaking Change 
+ - New or Enhanced Feature
+ - Bug, Docs Fix or other nominal change
 
 ##### COMPONENT NAME
 <!--- Name of the module/plugin/module/task -->
  - API
- - UI
  - Collection
-
-##### AWX VERSION
-<!--- Paste verbatim output from `make VERSION` between quotes below -->
-```
-
-```
+ - CLI
+ - Docs
+ - Other
 
 
-##### ADDITIONAL INFORMATION
+
+##### STEPS TO REPRODUCE AND EXTRA INFO
 <!---
 Include additional information to help people understand the change here.
 For bugs that don't have a linked bug report, a step-by-step reproduction

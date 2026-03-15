@@ -17,7 +17,7 @@ logger = logging.getLogger('awx.main.utils.ansible')
 __all__ = ['skip_directory', 'could_be_playbook', 'could_be_inventory']
 
 
-valid_playbook_re = re.compile(r'^\s*?-?\s*?(?:hosts|include|import_playbook):\s*?.*?$')
+valid_playbook_re = re.compile(r'^\s*?-?\s*?(?:hosts|(ansible\.builtin\.)?include|(ansible\.builtin\.)?import_playbook):\s*?.*?$')
 valid_inventory_re = re.compile(r'^[a-zA-Z0-9_.=\[\]]')
 
 
@@ -48,15 +48,16 @@ def could_be_playbook(project_path, dir_path, filename):
     # show up.
     matched = False
     try:
-        for n, line in enumerate(codecs.open(playbook_path, 'r', encoding='utf-8', errors='ignore')):
-            if valid_playbook_re.match(line):
-                matched = True
-                break
-            # Any YAML file can also be encrypted with vault;
-            # allow these to be used as the main playbook.
-            elif n == 0 and line.startswith('$ANSIBLE_VAULT;'):
-                matched = True
-                break
+        with codecs.open(playbook_path, 'r', encoding='utf-8', errors='ignore') as f:
+            for n, line in enumerate(f):
+                if valid_playbook_re.match(line):
+                    matched = True
+                    break
+                # Any YAML file can also be encrypted with vault;
+                # allow these to be used as the main playbook.
+                elif n == 0 and line.startswith('$ANSIBLE_VAULT;'):
+                    matched = True
+                    break
     except IOError:
         return None
     if not matched:

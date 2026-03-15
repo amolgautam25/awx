@@ -52,27 +52,21 @@ from awx.api.serializers import (
     WorkflowJobTemplateSerializer,
     CredentialSerializer,
 )
-from awx.api.views.mixin import RelatedJobsPreventDeleteMixin, OrganizationCountsMixin
+from awx.api.views.mixin import RelatedJobsPreventDeleteMixin, OrganizationCountsMixin, OrganizationInstanceGroupMembershipMixin
 
 logger = logging.getLogger('awx.api.views.organization')
 
 
 class OrganizationList(OrganizationCountsMixin, ListCreateAPIView):
-
     model = Organization
     serializer_class = OrganizationSerializer
-
-    def get_queryset(self):
-        qs = Organization.accessible_objects(self.request.user, 'read_role')
-        qs = qs.select_related('admin_role', 'auditor_role', 'member_role', 'read_role')
-        qs = qs.prefetch_related('created_by', 'modified_by')
-        return qs
+    resource_purpose = 'organizations'
 
 
 class OrganizationDetail(RelatedJobsPreventDeleteMixin, RetrieveUpdateDestroyAPIView):
-
     model = Organization
     serializer_class = OrganizationSerializer
+    resource_purpose = 'organization detail'
 
     def get_serializer_context(self, *args, **kwargs):
         full_context = super(OrganizationDetail, self).get_serializer_context(*args, **kwargs)
@@ -106,133 +100,135 @@ class OrganizationDetail(RelatedJobsPreventDeleteMixin, RetrieveUpdateDestroyAPI
 
 
 class OrganizationInventoriesList(SubListAPIView):
-
     model = Inventory
     serializer_class = InventorySerializer
     parent_model = Organization
     relationship = 'inventories'
+    resource_purpose = 'inventories of an organization'
 
 
 class OrganizationUsersList(BaseUsersList):
-
     model = User
     serializer_class = UserSerializer
     parent_model = Organization
     relationship = 'member_role.members'
     ordering = ('username',)
+    resource_purpose = 'users of an organization'
 
 
 class OrganizationAdminsList(BaseUsersList):
-
     model = User
     serializer_class = UserSerializer
     parent_model = Organization
     relationship = 'admin_role.members'
     ordering = ('username',)
+    resource_purpose = 'administrators of an organization'
 
 
 class OrganizationProjectsList(SubListCreateAPIView):
-
     model = Project
     serializer_class = ProjectSerializer
     parent_model = Organization
     parent_key = 'organization'
+    resource_purpose = 'projects of an organization'
 
 
 class OrganizationExecutionEnvironmentsList(SubListCreateAttachDetachAPIView):
-
     model = ExecutionEnvironment
     serializer_class = ExecutionEnvironmentSerializer
     parent_model = Organization
     relationship = 'executionenvironments'
     parent_key = 'organization'
     swagger_topic = "Execution Environments"
+    resource_purpose = 'execution environments of an organization'
 
 
 class OrganizationJobTemplatesList(SubListCreateAPIView):
-
     model = JobTemplate
     serializer_class = JobTemplateSerializer
     parent_model = Organization
     parent_key = 'organization'
+    resource_purpose = 'job templates of an organization'
 
 
 class OrganizationWorkflowJobTemplatesList(SubListCreateAPIView):
-
     model = WorkflowJobTemplate
     serializer_class = WorkflowJobTemplateSerializer
     parent_model = Organization
     parent_key = 'organization'
+    resource_purpose = 'workflow job templates of an organization'
 
 
 class OrganizationTeamsList(SubListCreateAttachDetachAPIView):
-
     model = Team
     serializer_class = TeamSerializer
     parent_model = Organization
     relationship = 'teams'
     parent_key = 'organization'
+    resource_purpose = 'teams of an organization'
 
 
 class OrganizationActivityStreamList(SubListAPIView):
-
     model = ActivityStream
     serializer_class = ActivityStreamSerializer
     parent_model = Organization
     relationship = 'activitystream_set'
     search_fields = ('changes',)
+    resource_purpose = 'activity stream for an organization'
 
 
 class OrganizationNotificationTemplatesList(SubListCreateAttachDetachAPIView):
-
     model = NotificationTemplate
     serializer_class = NotificationTemplateSerializer
     parent_model = Organization
     relationship = 'notification_templates'
     parent_key = 'organization'
+    resource_purpose = 'notification templates of an organization'
 
 
 class OrganizationNotificationTemplatesAnyList(SubListCreateAttachDetachAPIView):
-
     model = NotificationTemplate
     serializer_class = NotificationTemplateSerializer
     parent_model = Organization
+    resource_purpose = 'base view for notification templates of an organization'
 
 
 class OrganizationNotificationTemplatesStartedList(OrganizationNotificationTemplatesAnyList):
-
     relationship = 'notification_templates_started'
+    resource_purpose = 'notification templates for job started events of an organization'
 
 
 class OrganizationNotificationTemplatesErrorList(OrganizationNotificationTemplatesAnyList):
-
     relationship = 'notification_templates_error'
+    resource_purpose = 'notification templates for job error events of an organization'
 
 
 class OrganizationNotificationTemplatesSuccessList(OrganizationNotificationTemplatesAnyList):
-
     relationship = 'notification_templates_success'
+    resource_purpose = 'notification templates for job success events of an organization'
 
 
 class OrganizationNotificationTemplatesApprovalList(OrganizationNotificationTemplatesAnyList):
-
     relationship = 'notification_templates_approvals'
+    resource_purpose = 'notification templates for workflow approval events of an organization'
 
 
-class OrganizationInstanceGroupsList(SubListAttachDetachAPIView):
-
+class OrganizationInstanceGroupsList(OrganizationInstanceGroupMembershipMixin, SubListAttachDetachAPIView):
     model = InstanceGroup
     serializer_class = InstanceGroupSerializer
     parent_model = Organization
     relationship = 'instance_groups'
+    filter_read_permission = False
+    resource_purpose = 'instance groups of an organization'
 
 
 class OrganizationGalaxyCredentialsList(SubListAttachDetachAPIView):
-
     model = Credential
     serializer_class = CredentialSerializer
     parent_model = Organization
     relationship = 'galaxy_credentials'
+    filter_read_permission = False
+    resource_purpose = 'galaxy credentials of an organization'
 
     def is_valid_relation(self, parent, sub, created=False):
         if sub.kind != 'galaxy_api_token':
@@ -240,17 +236,18 @@ class OrganizationGalaxyCredentialsList(SubListAttachDetachAPIView):
 
 
 class OrganizationAccessList(ResourceAccessList):
-
     model = User  # needs to be User for AccessLists's
     parent_model = Organization
+    resource_purpose = 'users who can access the organization'
 
 
 class OrganizationObjectRolesList(SubListAPIView):
-
     model = Role
     serializer_class = RoleSerializer
     parent_model = Organization
     search_fields = ('role_field', 'content_type__model')
+    deprecated = True
+    resource_purpose = 'roles of an organization'
 
     def get_queryset(self):
         po = self.get_parent_object()

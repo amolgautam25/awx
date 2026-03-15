@@ -1,28 +1,23 @@
 import itertools
 import pytest
+from uuid import uuid4
 
 # CRUM
 from crum import impersonate
 
-# Django
-from django.contrib.contenttypes.models import ContentType
-
 # AWX
-from awx.main.models import UnifiedJobTemplate, Job, JobTemplate, WorkflowJobTemplate, WorkflowApprovalTemplate, Project, WorkflowJob, Schedule, Credential
+from awx.main.models import UnifiedJobTemplate, Job, JobTemplate, WorkflowJobTemplate, Project, WorkflowJob, Schedule, Credential
 from awx.api.versioning import reverse
 from awx.main.constants import JOB_VARIABLE_PREFIXES
 
 
 @pytest.mark.django_db
-def test_subclass_types(rando):
-    assert set(UnifiedJobTemplate._submodels_with_roles()) == set(
-        [
-            ContentType.objects.get_for_model(JobTemplate).id,
-            ContentType.objects.get_for_model(Project).id,
-            ContentType.objects.get_for_model(WorkflowJobTemplate).id,
-            ContentType.objects.get_for_model(WorkflowApprovalTemplate).id,
-        ]
-    )
+def test_subclass_types():
+    assert set(UnifiedJobTemplate._submodels_with_roles()) == {
+        JobTemplate,
+        Project,
+        WorkflowJobTemplate,
+    }
 
 
 @pytest.mark.django_db
@@ -37,6 +32,64 @@ def test_soft_unique_together(post, project, admin_user):
         expect=400,
     )
     assert 'combination already exists' in str(r.data)
+
+
+@pytest.mark.django_db
+class TestJobCancel:
+    """
+    Coverage for UnifiedJob.cancel, focused on interaction with dispatcherd objects.
+    Using mocks for the dispatcherd objects, because tests by default use a no-op broker.
+    """
+
+    def test_cancel_sets_flag_and_clears_start_args(self, mocker):
+        job = Job.objects.create(status='running', name='foo-job', celery_task_id=str(uuid4()), controller_node='foo', start_args='{"secret": "value"}')
+        job.websocket_emit_status = mocker.MagicMock()
+
+        assert job.can_cancel is True
+        assert job.cancel_flag is False
+
+        job.cancel()
+        job.refresh_from_db()
+
+        assert job.cancel_flag is True
+        assert job.start_args == ''
+
+    def test_cancel_sets_job_explanation(self, mocker):
+        job = Job.objects.create(status='running', name='foo-job', celery_task_id=str(uuid4()), controller_node='foo')
+        job.websocket_emit_status = mocker.MagicMock()
+        job_explanation = 'giggity giggity'
+
+        job.cancel(job_explanation=job_explanation)
+        job.refresh_from_db()
+
+        assert job.job_explanation == job_explanation
+
+    def test_cancel_sends_control_message(self, mocker):
+        celery_task_id = str(uuid4())
+        job = Job.objects.create(status='running', name='foo-job', celery_task_id=celery_task_id, controller_node='foo')
+        job.websocket_emit_status = mocker.MagicMock()
+        control = mocker.MagicMock()
+        get_control = mocker.patch('awx.main.models.unified_jobs.get_control_from_settings', return_value=control)
+
+        job.cancel()
+
+        get_control.assert_called_once_with(default_publish_channel='foo')
+        control.control.assert_called_once_with('cancel', data={'uuid': celery_task_id})
+
+    def test_cancel_refreshes_task_id_before_sending_control(self, mocker):
+        job = Job.objects.create(status='pending', name='foo-job', celery_task_id='', controller_node='bar')
+        job.websocket_emit_status = mocker.MagicMock()
+        celery_task_id = str(uuid4())
+        Job.objects.filter(pk=job.pk).update(status='running', celery_task_id=celery_task_id)
+        control = mocker.MagicMock()
+        get_control = mocker.patch('awx.main.models.unified_jobs.get_control_from_settings', return_value=control)
+        refresh_spy = mocker.spy(job, 'refresh_from_db')
+
+        job.cancel()
+
+        refresh_spy.assert_called_once_with(fields=['celery_task_id', 'controller_node'])
+        get_control.assert_called_once_with(default_publish_channel='bar')
+        control.control.assert_called_once_with('cancel', data={'uuid': celery_task_id})
 
 
 @pytest.mark.django_db
@@ -252,12 +305,14 @@ class TestTaskImpact:
     def test_limit_task_impact(self, job_host_limit, run_computed_fields_right_away):
         job = job_host_limit(5, 2)
         job.inventory.update_computed_fields()
+        job.task_impact = job._get_task_impact()
         assert job.inventory.total_hosts == 5
         assert job.task_impact == 2 + 1  # forks becomes constraint
 
     def test_host_task_impact(self, job_host_limit, run_computed_fields_right_away):
         job = job_host_limit(3, 5)
         job.inventory.update_computed_fields()
+        job.task_impact = job._get_task_impact()
         assert job.task_impact == 3 + 1  # hosts becomes constraint
 
     def test_shard_task_impact(self, slice_job_factory, run_computed_fields_right_away):
@@ -270,9 +325,13 @@ class TestTaskImpact:
         # Even distribution - all jobs run on 1 host
         assert [len(jobs[0].inventory.get_script_data(slice_number=i + 1, slice_count=3)['all']['hosts']) for i in range(3)] == [1, 1, 1]
         jobs[0].inventory.update_computed_fields()
+        for j in jobs:
+            j.task_impact = j._get_task_impact()
         assert [job.task_impact for job in jobs] == [2, 2, 2]  # plus one base task impact
         # Uneven distribution - first job takes the extra host
         jobs[0].inventory.hosts.create(name='remainder_foo')
         assert [len(jobs[0].inventory.get_script_data(slice_number=i + 1, slice_count=3)['all']['hosts']) for i in range(3)] == [2, 1, 1]
         jobs[0].inventory.update_computed_fields()
+        # recalculate task_impact
+        jobs[0].task_impact = jobs[0]._get_task_impact()
         assert [job.task_impact for job in jobs] == [3, 2, 2]

@@ -26,21 +26,25 @@ from awx.api.generics import APIView, GenericAPIView, ListAPIView, RetrieveUpdat
 from awx.api.permissions import IsSystemAdminOrAuditor
 from awx.api.versioning import reverse
 from awx.main.utils import camelcase_to_underscore
-from awx.main.tasks.system import handle_setting_changes
+from awx.main.tasks.system import clear_setting_cache
 from awx.conf.models import Setting
 from awx.conf.serializers import SettingCategorySerializer, SettingSingletonSerializer
 from awx.conf import settings_registry
-
+from awx.main.utils.external_logging import reconfigure_rsyslog
+from ansible_base.lib.utils.schema import extend_schema_if_available
 
 SettingCategory = collections.namedtuple('SettingCategory', ('url', 'slug', 'name'))
 
 
 class SettingCategoryList(ListAPIView):
-
     model = Setting  # Not exactly, but needed for the view.
     serializer_class = SettingCategorySerializer
     filter_backends = []
     name = _('Setting Categories')
+
+    @extend_schema_if_available(extensions={"x-ai-description": "A list of additional API endpoints related to settings."})
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
 
     def get_queryset(self):
         setting_categories = []
@@ -58,11 +62,14 @@ class SettingCategoryList(ListAPIView):
 
 
 class SettingSingletonDetail(RetrieveUpdateDestroyAPIView):
-
     model = Setting  # Not exactly, but needed for the view.
     serializer_class = SettingSingletonSerializer
     filter_backends = []
     name = _('Setting Detail')
+
+    @extend_schema_if_available(extensions={"x-ai-description": "Update system settings."})
+    def patch(self, request, *args, **kwargs):
+        return super().patch(request, *args, **kwargs)
 
     def get_queryset(self):
         self.category_slug = self.kwargs.get('category_slug', 'all')
@@ -120,7 +127,10 @@ class SettingSingletonDetail(RetrieveUpdateDestroyAPIView):
                 setting.save(update_fields=['value'])
                 settings_change_list.append(key)
         if settings_change_list:
-            connection.on_commit(lambda: handle_setting_changes.delay(settings_change_list))
+            connection.on_commit(lambda: clear_setting_cache.delay(settings_change_list))
+            if any([setting.startswith('LOG_AGGREGATOR') for setting in settings_change_list]):
+                # call notify to rsyslog. no data is need so payload is empty
+                reconfigure_rsyslog.delay()
 
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
@@ -135,7 +145,10 @@ class SettingSingletonDetail(RetrieveUpdateDestroyAPIView):
             setting.delete()
             settings_change_list.append(setting.key)
         if settings_change_list:
-            connection.on_commit(lambda: handle_setting_changes.delay(settings_change_list))
+            connection.on_commit(lambda: clear_setting_cache.delay(settings_change_list))
+            if any([setting.startswith('LOG_AGGREGATOR') for setting in settings_change_list]):
+                # call notify to rsyslog. no data is need so payload is empty
+                reconfigure_rsyslog.delay()
 
         # When TOWER_URL_BASE is deleted from the API, reset it to the hostname
         # used to make the request as a default.
@@ -146,7 +159,6 @@ class SettingSingletonDetail(RetrieveUpdateDestroyAPIView):
 
 
 class SettingLoggingTest(GenericAPIView):
-
     name = _('Logging Connectivity Test')
     model = Setting
     serializer_class = SettingSingletonSerializer
@@ -183,7 +195,7 @@ class SettingLoggingTest(GenericAPIView):
             if not port:
                 return Response({'error': 'Port required for ' + protocol}, status=status.HTTP_400_BAD_REQUEST)
         else:
-            # if http/https by this point, domain is reacheable
+            # if http/https by this point, domain is reachable
             return Response(status=status.HTTP_202_ACCEPTED)
 
         if protocol == 'udp':

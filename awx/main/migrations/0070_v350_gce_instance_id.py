@@ -8,7 +8,6 @@ from django.db import migrations
 
 from awx.main.migrations._inventory_source import set_new_instance_id, back_out_new_instance_id
 
-
 logger = logging.getLogger('awx.main.migrations')
 
 
@@ -25,7 +24,6 @@ def gce_id_backward(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('main', '0069_v350_generate_unique_install_uuid'),
     ]
